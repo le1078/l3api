@@ -1,0 +1,94 @@
+services:
+  l3api:
+    build: .
+    # 显式钉住镜像 tag：不带 image 时 compose 用「目录名-service」默认 tag，
+    # 升级时容易把容器重建回旧镜像（v1.15.4 踩过）。
+    image: l3api-cloud-v1163-2026-10-13-l3api:latest
+    container_name: l3api
+    restart: unless-stopped
+    # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致
+    # 「写入 auths/*.json.tmp 失败 permission denied」，三种解法任选：
+    #   1) 非 root · 让容器以你自己的 uid 运行（挂载目录本来就是你建的）：
+    #      PUID=$(id -u) PGID=$(id -g) docker compose up -d
+    #      或写进 .env 文件：PUID=1000 / PGID=1000
+    #   2) sudo chown -R 10001:10001 ./auths ./data ./config.json
+    #   3) user: "0:0" 以 root 运行（省事但容器逃逸面更大，自担）
+    user: "${PUID:-10001}:${PGID:-10001}"
+    environment:
+      # 关键：冷却重置（次日 04:00）、签到/夜猫子/旅行等调度时刻全部按容器
+      # 本地时区计算——云部署忘了设 TZ 会整体错位 8 小时（UTC）。
+      - TZ=Asia/Shanghai
+    ports:
+      # 生产安全默认：只绑回环，公网入口交给前置 Nginx/Caddy TLS 反代
+      # （SSE 需 proxy_buffering off + 长 read timeout，样例见 README 云部署段）。
+      # 仅本机/内网直连使用时才改成 "127.0.0.1:7863:7863"（裸绑 0.0.0.0，务必确认 api_key 是强随机值）。
+      - "127.0.0.1:7863:7863"
+    # 日志轮转：chat 每请求一行表格日志，不限制会把磁盘打爆。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # 内存兜底：进程异常膨胀时由 cgroup 兜住，避免拖垮宿主机。
+    mem_limit: 512m
+    volumes:
+      - ./auths:/app/auths
+      - ./data:/app/data
+      # 注意：宿主机必须先有 config.json（cp config.example.json config.json
+      # 并把 api_key 改成强随机值）。缺失时 Docker 会把挂载点创建成目录 →
+      # 容器启动失败（程序虽能自动生成配置，但挂载点挡成目录后写不进去）。
+      # 不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
+      # 部署约束：单实例运行——多容器共享同一 data/ 卷（含 NFS）会互相覆盖
+      # state.json（tmp+rename 只保证进程内原子，跨进程无文件锁）。
+      - ./config.json:/app/config.json
+
+  # Prometheus（方案 A：与 l3api 同机、同 compose 网络）。
+  # 抓取 http://l3api:7863/metrics（容器内端口，无需鉴权配置）；
+  # UI 仅绑回环 127.0.0.1:9090，公网访问走反代 + 自行加鉴权，或直接不开放。
+  # 数据落 ./data/prometheus（保留 15 天，约 200~400MB；内存限额 384m 够用）。
+  prometheus:
+    # 默认不启动（省内存）：需要监控时 docker compose --profile prometheus up -d
+    profiles: ["prometheus"]
+    image: prom/prometheus:v2.53.0
+    container_name: l3api-prometheus
+    restart: unless-stopped
+    depends_on:
+      - l3api
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 384m
+
+  # 可选：Grafana 图表（docker compose --profile grafana up -d 启动）。
+  # 数据源指向 http://prometheus:9090（compose 内网），UI 绑回环 127.0.0.1:3000。
+  # 不需要图表时可以整段删除/不启动，Prometheus 自带基础查询页够看数字。
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: l3api-grafana
+    restart: unless-stopped
+    profiles: ["grafana"]
+    depends_on:
+      - prometheus
+    volumes:
+      - ./data/grafana:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin   # 首次登录改掉，或仅回环使用
+      - TZ=Asia/Shanghai
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 256m

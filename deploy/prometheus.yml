@@ -1,0 +1,17 @@
+# Prometheus 抓取配置（方案 A：与 l3api 同机、同 compose 网络）。
+#
+# 抓取目标用服务名 l3api:7863（容器内部端口，绕过宿主机 127.0.0.1 发布限制）：
+# l3api 的 /metrics 不鉴权，但不经 compose 网络不可达——宿主机端口发布仍是
+# 127.0.0.1:7863，公网反代拦截 /metrics 后（见 DEPLOY.md），此端点不暴露公网。
+global:
+  scrape_interval: 15s     # 常规抓取
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+scrape_configs:
+  - job_name: l3api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["l3api:7863"]
+        labels:
+          instance: l3api-primary
