@@ -2,7 +2,7 @@
 
 AI 模型 API 聚合网关：把多个品牌的免费/促销额度账号聚合成一个池子，对外提供统一的 OpenAI / Anthropic / Responses 三种协议端点，并自动完成各品牌的**每日签到、积分任务与保活**。
 
-> 本项目是在 [workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 基础上的魔改二创，感谢原作者的开源工作。本分支的主打方向是 **CodeBuddy / Qoder / Trae 三品牌的签到自动化 + 统一 API 调用**。
+> 本项目是在 [workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 基础上的魔改二创，其原始上游为 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)，感谢两位作者的开源工作。本分支的主打方向是 **CodeBuddy / Qoder / Trae 三品牌的签到自动化 + 统一 API 调用**。
 
 ## 特点
 
@@ -67,4 +67,8 @@ curl http://127.0.0.1:7863/v1/chat/completions \
 
 ## 免责声明
 
-本项目仅供学习交流。各品牌积分/额度策略以其官方条款为准，使用本项目产生的一切后果由使用者自行承担。
+本项目仅供学习交流。各品牌积分/额度策略以其官方条款为准，使用本项目产生的一切后果由使用者自行承担。请勿用于批量注册账号、分发/转售接口配额或任何违反上游平台服务条款的用途。
+
+## License
+
+[MIT License](LICENSE)。版权归属链：Sliverkiss（[workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)）→ linguo2625469（[workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)）→ 本分支。再分发时请保留 LICENSE 中的版权声明。
