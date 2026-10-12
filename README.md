@@ -31,11 +31,10 @@ AI 模型 API 聚合网关：把多个品牌的免费/促销额度账号聚合�
 
 ```bash
 # 需要 Docker；Go 1.22+ 仅本机开发需要
-cp config.json config.json.bak   # 如需备份
-docker compose up -d --build
+sh cloud-init.sh   # 检查环境 → 生成含强随机 api_key 的 config.json → 构建 → 启动 → 冒烟
 ```
 
-服务监听 `:7863`（compose 默认只绑 `127.0.0.1`，公网请走 TLS 反代，样例见 [DEPLOY.md](DEPLOY.md)）。
+服务监听 `:7863`（compose 默认只绑 `127.0.0.1`，公网请走 TLS 反代，样例见 [DEPLOY.md](DEPLOY.md)）。注意：`config.json` 必须先于 `docker compose up` 存在（cloud-init.sh 已处理），否则 Docker 会把挂载点建成目录导致启动失败。
 
 - 管理面板：`http://127.0.0.1:7863/panel/`（密钥 = config.json 的 `api_key`）
 - 健康探针：`/livez`（进程）/ `/healthz`（池内有可用账号才 200，给 LB 用）
