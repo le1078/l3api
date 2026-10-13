@@ -333,36 +333,6 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	return earliest, kinds
 }
 
-// NextWakeInfo 暴露下次唤醒时刻与任务名（面板顶部「下次定时任务」卡片用）。
-// 全部任务关闭时返回零时间与空列表。
-func (s *Scheduler) NextWakeInfo() (time.Time, []string) {
-	at, kinds := s.nextWake(time.Now())
-	names := make([]string, 0, len(kinds))
-	for _, k := range kinds {
-		names = append(names, k.String())
-	}
-	return at, names
-}
-
-func (k taskKind) String() string {
-	switch k {
-	case taskCheckin:
-		return "签到"
-	case taskTravel:
-		return "猫猫旅行"
-	case taskActivity:
-		return "活跃上报"
-	case taskKeepalive:
-		return "Token 保活"
-	case taskBlackcat:
-		return "夜猫子"
-	case taskProbe:
-		return "定时体检"
-	default:
-		return "未知任务"
-	}
-}
-
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
 func (s *Scheduler) Run(ctx context.Context) {

@@ -734,12 +734,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <!-- 顶部只留全局量：账号状态计数（总数/可用/冷却/禁用）由下方品牌墙与
            总统计条承担，同屏重复三遍会训练用户全部忽略，真异常反而看不见。
            卡片语义分工：存量（积分）→ 产出（今日请求/Token）→ 负载（在途）
-           → 计划（下次定时任务）→ 会话（粘性）。 -->
+           → 会话（粘性）。 -->
       <div class="stats">
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sToday">-</div><div class="k">今日请求 · Token</div></div>
         <div class="stat"><div class="v" id="sInFlight">-</div><div class="k">在途请求</div></div>
-        <div class="stat"><div class="v" id="sNextTask" style="font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">-</div><div class="k">下次定时任务</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
 
@@ -1395,6 +1394,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div id="toasts"></div>
 
 <script src="echarts.min.js"></script>
-<script src="app.js?v=1.16.4"></script>
+<script src="app.js?v=1.16.5"></script>
 </body>
 </html>

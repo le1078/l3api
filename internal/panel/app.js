@@ -799,10 +799,6 @@ async function loadOverview(quiet) {
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
     $('sToday').textContent = fmtNum(d.today_requests || 0) + ' · ' + fmtTok(d.today_tokens || 0);
     $('sInFlight').textContent = d.in_flight || 0;
-    $('sNextTask').textContent = d.next_task_at
-      ? (d.next_task_at.slice(5) + ' ' + (d.next_task_names || []).join('+'))
-      : '—';
-    $('sNextTask').title = d.next_task_at || '';
     $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
