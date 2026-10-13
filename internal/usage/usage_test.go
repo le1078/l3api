@@ -41,6 +41,8 @@ func TestAddAndTotals(t *testing.T) {
 }
 
 // Rollup 把超出 hourlyKeep 的小时桶折叠为日桶，且幂等：重复折叠不重复计数。
+// Totals 只统计所选窗口内的桶：100 天前的桶在 24h 窗口口径下不计入，
+// 但仍以日点形式留在 Series（历史不丢）。
 func TestRollupIdempotent(t *testing.T) {
 	r := New("")
 	old := time.Now().AddDate(0, 0, -100) // 100 天前，超出 90 天小时保留
@@ -50,8 +52,8 @@ func TestRollupIdempotent(t *testing.T) {
 
 	r.Rollup(time.Now())
 	after := r.Snapshot(24, nil, nil)
-	if after.Totals.Requests != 3 || after.Totals.PromptTokens != 15 {
-		t.Fatalf("折叠后 totals = %d/%d, want 3/15", after.Totals.Requests, after.Totals.PromptTokens)
+	if after.Totals.Requests != 1 || after.Totals.PromptTokens != 1 {
+		t.Fatalf("折叠后 24h 窗口 totals = %d/%d, want 1/1（窗口外历史不计入）", after.Totals.Requests, after.Totals.PromptTokens)
 	}
 	if len(after.Series) != 2 || after.Series[0].Scope != "day" || after.Series[1].Scope != "hour" {
 		t.Fatalf("series = %+v, want 日点在前 + 小时点在后", after.Series)
@@ -59,8 +61,25 @@ func TestRollupIdempotent(t *testing.T) {
 
 	r.Rollup(time.Now())
 	again := r.Snapshot(24, nil, nil)
-	if again.Totals.Requests != 3 || again.Totals.PromptTokens != 15 {
-		t.Fatalf("二次折叠后 totals = %d/%d, want 3/15（幂等被破坏）", again.Totals.Requests, again.Totals.PromptTokens)
+	if again.Totals.Requests != 1 || again.Totals.PromptTokens != 1 {
+		t.Fatalf("二次折叠后 totals = %d/%d, want 1/1（幂等被破坏）", again.Totals.Requests, again.Totals.PromptTokens)
+	}
+}
+
+// 卡片/表格（Totals/By*）随所选窗口变化：窗口外的历史不进入汇总数字。
+func TestSnapshotWindowedTotals(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now.Add(-48*time.Hour), "cn", "u1", "m1", Delta{PromptTokens: 100, HasPromptTokens: true}, true) // 3 天窗口内、24h 窗口外
+	r.Add(now, "cn", "u1", "m1", Delta{PromptTokens: 3, HasPromptTokens: true}, true)
+
+	s24 := r.Snapshot(24, nil, nil)
+	if s24.Totals.Requests != 1 || s24.Totals.PromptTokens != 3 {
+		t.Fatalf("24h totals = %d/%d, want 1/3", s24.Totals.Requests, s24.Totals.PromptTokens)
+	}
+	s72 := r.Snapshot(72, nil, nil)
+	if s72.Totals.Requests != 2 || s72.Totals.PromptTokens != 103 {
+		t.Fatalf("72h totals = %d/%d, want 2/103", s72.Totals.Requests, s72.Totals.PromptTokens)
 	}
 }
 
@@ -248,5 +267,24 @@ func TestSnapshotWindow(t *testing.T) {
 		if to.Before(time.Now().Add(-2 * time.Hour)) {
 			t.Fatalf("window_to=%q 明显早于现在", s.WindowTo)
 		}
+	}
+}
+
+// TestTodayTotals 今日合计只计入今天的小时桶，昨天及更早的不算。
+func TestTodayTotals(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "u1", "m", Delta{TotalTokens: 100, HasTotal: true}, true)
+	r.Add(now, "global", "u2", "m", Delta{PromptTokens: 30, HasPromptTokens: true, CompletionTokens: 20, HasCompletion: true}, true)
+	// 昨天的桶不应计入
+	y := now.Add(-26 * time.Hour)
+	r.Add(y, "cn", "u1", "m", Delta{TotalTokens: 999, HasTotal: true}, true)
+
+	req, tok := r.TodayTotals()
+	if req != 2 {
+		t.Errorf("requests=%d want 2", req)
+	}
+	if tok != 150 {
+		t.Errorf("tokens=%d want 150（100 + 30+20 回退）", tok)
 	}
 }

@@ -290,6 +290,25 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
 	}
+	// 在途请求：瞬时负载信号（池打满与否先看这里）。
+	inFlight := 0
+	for _, st := range p.cfg.Pool.List() {
+		inFlight += st.InFlight
+	}
+	// 今日产出（usage 可能未启用，零值即可）。
+	var todayReq, todayTok int64
+	if p.cfg.Usage != nil {
+		todayReq, todayTok = p.cfg.Usage.TodayTotals()
+	}
+	// 下次定时任务（全部关闭时零值，前端显示「—」）。
+	var nextAt string
+	var nextNames []string
+	if p.cfg.Scheduler != nil {
+		if at, names := p.cfg.Scheduler.NextWakeInfo(); !at.IsZero() {
+			nextAt = at.Format("2006-01-02 15:04")
+			nextNames = names
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
@@ -301,6 +320,11 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"cooling":         cooling,
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
+		"in_flight":       inFlight,
+		"today_requests":  todayReq,
+		"today_tokens":    todayTok,
+		"next_task_at":    nextAt,
+		"next_task_names": nextNames,
 		"accounts":        p.accountsView(),
 	})
 }

@@ -797,6 +797,12 @@ async function loadOverview(quiet) {
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
+    $('sToday').textContent = fmtNum(d.today_requests || 0) + ' · ' + fmtTok(d.today_tokens || 0);
+    $('sInFlight').textContent = d.in_flight || 0;
+    $('sNextTask').textContent = d.next_task_at
+      ? (d.next_task_at.slice(5) + ' ' + (d.next_task_names || []).join('+'))
+      : '—';
+    $('sNextTask').title = d.next_task_at || '';
     $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
@@ -2043,12 +2049,9 @@ function renderUsage(d) {
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
     usStat(fmtMs(t.avg_latency_ms), '平均延迟');
 
-  // 卡片与表格给的是**全部历史**的累计值，只有下面的时序图按所选窗口展示。
-  //
-  // 这是后端的既定口径（Snapshot 的注释：「聚合当前全部桶。hours 控制时序返回
-  // 多少个小时点」），不是缺陷——但界面上不写明，切 24 小时 / 30 天时这几个数字
-  // 纹丝不动，就会被读成「没生效」。所以把口径差异直接写在标题栏。
-  $('usNote').textContent = '卡片为累计值（自启用起，不随窗口变化）· ' +
+  // 卡片与表格均按所选窗口统计（后端 Snapshot 按窗口聚合 Totals/By*），
+  // 与时序图同口径；切换窗口后所有数字一起变。
+  $('usNote').textContent = '卡片与表格按所选窗口统计 · ' +
     (d.buckets || 0) + ' 个分桶' +
     (d.file_bytes ? ' · ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
 

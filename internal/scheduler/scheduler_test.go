@@ -452,3 +452,25 @@ func TestCreditNoteWindow(t *testing.T) {
 		t.Errorf("unknown badge = %q want %q", got, want)
 	}
 }
+
+// TestNextWakeInfoNames 对外信息口返回中文任务名，零时点返回空。
+func TestNextWakeInfoNames(t *testing.T) {
+	s := New(Config{CheckinHours: []int{9}, KeepaliveHours: []int{22},
+		TravelDisabled: true, ActivityDisabled: true, BlackcatDisabled: true, ProbeDisabled: true})
+	at, names := s.NextWakeInfo()
+	if at.IsZero() || len(names) == 0 {
+		t.Fatalf("at=%v names=%v, want 非零时点+非空任务名", at, names)
+	}
+	for _, n := range names {
+		if n == "未知任务" {
+			t.Errorf("出现未命名任务 kinds=%v", names)
+		}
+	}
+	// 全关 → 零时间空列表
+	s2 := New(Config{CheckinDisabled: true, TravelDisabled: true, ActivityDisabled: true,
+		KeepaliveDisabled: true, BlackcatDisabled: true, ProbeDisabled: true})
+	at2, names2 := s2.NextWakeInfo()
+	if !at2.IsZero() || len(names2) != 0 {
+		t.Errorf("全关应零值: at=%v names=%v", at2, names2)
+	}
+}

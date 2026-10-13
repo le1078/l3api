@@ -452,8 +452,34 @@ type Snapshot struct {
 	WindowHours int    `json:"window_hours,omitempty"`
 }
 
-// Snapshot 聚合当前全部桶。hours 控制时序返回多少个小时点（其余按日折叠）。
+// Snapshot 聚合面板一次拉取的用量视图。hours 同时控制时序窗口（小时点个数，
+// 其余折叠为日点）与汇总口径：Totals 与 By* 各表只统计落在所选窗口内的桶
+// （日粒度桶按所在日纳入），切换「近 3 天 / 近 7 天」时卡片数字随窗口变化。
 // nicks 是 uid→昵称映射，仅用于展示。
+// TodayTotals 今日（本地时区）请求数与 token 合计，面板顶部「今日请求/Token」卡用。
+// 只扫小时桶：今天的桶必然还是 h: 粒度（日粒度折叠只发生在更老的历史上）。
+// TT 是上游给的合计口径，缺失时（老桶）退 PT+CT。
+func (r *Recorder) TodayTotals() (requests, tokens int64) {
+	if r == nil {
+		return 0, 0
+	}
+	prefix := "h:" + time.Now().Format(dayLayout)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, b := range r.buckets {
+		if !strings.HasPrefix(b.Scope, prefix) {
+			continue
+		}
+		requests += b.Req
+		if b.TT > 0 {
+			tokens += b.TT
+		} else {
+			tokens += b.PT + b.CT
+		}
+	}
+	return requests, tokens
+}
+
 func (r *Recorder) Snapshot(hours int, nicks, brands map[string]string) Snapshot {
 	if r == nil {
 		return Snapshot{Generated: time.Now().Format(time.RFC3339)}
@@ -490,43 +516,12 @@ func (r *Recorder) Snapshot(hours int, nicks, brands map[string]string) Snapshot
 
 	nowHour := time.Now().Truncate(time.Hour)
 	hourFrom := nowHour.Add(-time.Duration(hours-1) * time.Hour)
+	// 日粒度桶只有整天边界，窗口口径按「所在日不早于窗口起点所在日」纳入
+	// （会多算窗口首日 0 点到 hourFrom 这段，日粒度无法更细，可接受）。
+	dayFrom := hourFrom.Format(dayLayout)
 
 	for i := range bs {
 		b := &bs[i]
-		total.add(b)
-
-		if realmAgg[b.Realm] == nil {
-			realmAgg[b.Realm] = &aggAcc{}
-		}
-		realmAgg[b.Realm].add(b)
-
-		if acctAgg[b.UID] == nil {
-			acctAgg[b.UID] = &aggAcc{}
-		}
-		acctAgg[b.UID].add(b)
-		// 一个账号只属于一个 realm，这里记下来供前端展示「域」列；
-		// keyed() 的 Realm 字段默认是空的（它按 key 分组，不知道 realm）。
-		if acctRealm[b.UID] == "" {
-			acctRealm[b.UID] = b.Realm
-		}
-
-		if modelAgg[b.Model] == nil {
-			modelAgg[b.Model] = &aggAcc{}
-		}
-		modelAgg[b.Model].add(b)
-
-		mk := b.UID + "\x00" + b.Model
-		if modelAcctAgg[mk] == nil {
-			modelAcctAgg[mk] = &aggAcc{}
-		}
-		modelAcctAgg[mk].add(b)
-
-		if b.Key != "" {
-			if keyAgg[b.Key] == nil {
-				keyAgg[b.Key] = &aggAcc{}
-			}
-			keyAgg[b.Key].add(b)
-		}
 
 		scope := strings.TrimPrefix(b.Scope, "h:")
 		isHour := strings.HasPrefix(b.Scope, "h:")
@@ -542,6 +537,46 @@ func (r *Recorder) Snapshot(hours int, nicks, brands map[string]string) Snapshot
 			inWin = !ts.Before(hourFrom)
 			dayScope = ts.Format(dayLayout)
 		}
+		// inWindow 决定这个桶是否计入卡片/表格（Totals/By*）：小时桶按窗口，
+		// 日桶按所在日。窗口外的历史只进时序的折叠日点，不进汇总数字。
+		inWindow := inWin || (!isHour && strings.TrimPrefix(b.Scope, "d:") >= dayFrom)
+		if inWindow {
+			total.add(b)
+
+			if realmAgg[b.Realm] == nil {
+				realmAgg[b.Realm] = &aggAcc{}
+			}
+			realmAgg[b.Realm].add(b)
+
+			if acctAgg[b.UID] == nil {
+				acctAgg[b.UID] = &aggAcc{}
+			}
+			acctAgg[b.UID].add(b)
+			// 一个账号只属于一个 realm，这里记下来供前端展示「域」列；
+			// keyed() 的 Realm 字段默认是空的（它按 key 分组，不知道 realm）。
+			if acctRealm[b.UID] == "" {
+				acctRealm[b.UID] = b.Realm
+			}
+
+			if modelAgg[b.Model] == nil {
+				modelAgg[b.Model] = &aggAcc{}
+			}
+			modelAgg[b.Model].add(b)
+
+			mk := b.UID + "\x00" + b.Model
+			if modelAcctAgg[mk] == nil {
+				modelAcctAgg[mk] = &aggAcc{}
+			}
+			modelAcctAgg[mk].add(b)
+
+			if b.Key != "" {
+				if keyAgg[b.Key] == nil {
+					keyAgg[b.Key] = &aggAcc{}
+				}
+				keyAgg[b.Key].add(b)
+			}
+		}
+
 		// dimAdd 把一个桶累加进 (维度值, 时间片) 的序列格。
 		dimAdd := func(m map[string]map[string]*aggAcc, name, slot string) {
 			inner := m[name]
