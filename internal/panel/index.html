@@ -673,6 +673,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .pk-legend .lg-val { font-family: var(--mono); color: var(--ink-3); white-space: nowrap; }
 
 </style>
+<!-- 首帧主题引导：必须放在 <head> 且同步执行，绘制前定好 data-theme，
+     否则会先渲染深色默认值再被 app.js 翻成浅色（FOUC 黑闪）。 -->
+<script src="theme.js?v=1.16.6"></script>
 </head>
 <body>
 <div class="shell">
@@ -1394,6 +1397,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div id="toasts"></div>
 
 <script src="echarts.min.js"></script>
-<script src="app.js?v=1.16.5"></script>
+<script src="app.js?v=1.16.6"></script>
 </body>
 </html>

@@ -21,6 +21,9 @@ var indexHTML []byte
 //go:embed app.js
 var appJS []byte
 
+//go:embed theme.js
+var themeJS []byte
+
 //go:embed echarts.min.js
 var echartsJS []byte
 
@@ -79,4 +82,14 @@ func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache") // 同上：随版本更新即时生效
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(appJS)
+}
+
+// themeScript 输出首帧主题引导脚本（head 内同步加载，绘制前定好 data-theme，
+// 消除「深色闪一下再变白」）。no-cache：与 app.js 同口径，随版本即时生效。
+func (p *Panel) themeScript(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(themeJS)
 }

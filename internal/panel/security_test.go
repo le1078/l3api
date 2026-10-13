@@ -95,6 +95,41 @@ func TestAppScriptServed(t *testing.T) {
 	}
 }
 
+// theme.js 首帧主题引导：必须被页面在 <head> 内同步引用（早于 body 与 app.js），
+// 且能作为同源脚本取到。这是「深色闪一下再变白」FOUC 的修复要件。
+func TestThemeScriptPreventsFOUC(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	headEnd := strings.Index(body, "</head>")
+	if headEnd < 0 {
+		t.Fatal("no </head> in index.html")
+	}
+	themeRef := strings.Index(body, `<script src="theme.js?v=`)
+	appRef := strings.Index(body, `<script src="app.js?v=`)
+	if themeRef < 0 {
+		t.Fatal("index.html must reference theme.js (external, CSP-safe)")
+	}
+	if themeRef > headEnd {
+		t.Error("theme.js must be inside <head> so it runs before first paint")
+	}
+	if appRef >= 0 && themeRef > appRef {
+		t.Error("theme.js must load before app.js (which only re-applies theme later)")
+	}
+
+	// 脚本本身可取到且写入 data-theme。
+	rec2 := httptest.NewRecorder()
+	p.ServeHTTP(rec2, httptest.NewRequest("GET", "/panel/theme.js", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("theme.js code=%d want 200", rec2.Code)
+	}
+	if !strings.Contains(rec2.Body.String(), "dataset.theme") {
+		t.Error("theme.js must set documentElement.dataset.theme")
+	}
+}
+
 // UID 白名单：拒绝路径穿越与异常字符，放行真实 UUID 形态。
 func TestValidUID(t *testing.T) {
 	ok := []string{
