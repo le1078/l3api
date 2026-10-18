@@ -605,7 +605,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" data-row-uid="' + esc(s.uid) + '" title="点击查看账号详情">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm nm-flex"><span class="nmtxt">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + '</span>' + (brandOf(s) !== 'codebuddy' ? '<span class="brand-tag ' + esc(brandOf(s)) + '">' + (BRAND_LABEL[brandOf(s)] || brandOf(s)) + '</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' +
+      '<td class="who"><div class="nm nm-flex"><span class="nmtxt">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + '</span></div><div class="id">' + esc(short) + '</div>' +
         (s.note ? '<div class="hint" style="font-size:11px;color:var(--ink-3);margin-top:2px" title="' + esc(s.note) + '">备注：' + esc(s.note) + '</div>' : '') + '</td>' +
       '<td>' + tag + note + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
@@ -795,8 +795,12 @@ async function loadOverview(quiet) {
     overviewData = d;
     rebuildBrandMap();
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
-  const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
-  $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
+    const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
+    $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
+    // 今日消耗（v1.16.9）：后端按今日小时桶累加上游 usage.credit 实测扣费。
+    // 整数就显示整数，有小数保留一位（积分额度本身是整数，小数来自按 token 折算）。
+    const td = Number(d.today_credits || 0);
+    $('sCreditsToday').textContent = Number.isInteger(td) ? fmtNum(td) : td.toFixed(1);
     $('sToday').textContent = fmtNum(d.today_requests || 0) + ' · ' + fmtTok(d.today_tokens || 0);
     $('sInFlight').textContent = d.in_flight || 0;
     $('sSticky').textContent = d.sticky_sessions;
@@ -1990,6 +1994,21 @@ function fmtTok(n) {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
   return String(n);
 }
+/* fmtCredits 积分数量格式化：整数直接显示，小数保留一到两位。
+   上游 credit 是小数（如 0.37/0.1），图表 y 轴与 tooltip 都用它，
+   不能套 fmtTok（那个按 1000 进位，0.37 会显示成「0.37」但 1500 显示 1.5k，
+   积分场景下 1.5k 积分反而不如 1500 直观）。 */
+function fmtCredits(n) {
+  n = Number(n || 0);
+  if (!isFinite(n)) return '0';
+  if (Number.isInteger(n)) return n.toLocaleString('en-US');
+  const abs = Math.abs(n);
+  if (abs >= 100) return n.toFixed(0);
+  if (abs >= 10) return n.toFixed(1);
+  if (abs >= 0.1) return n.toFixed(2);
+  // 小值（每千 token 积分常见 0.003 这种）保留有效数字，否则一片 0.00 看不出差别
+  return n.toFixed(4);
+}
 function fmtMs(ms) {
   ms = Number(ms || 0);
   if (!ms) return '—';
@@ -2040,6 +2059,7 @@ function renderUsage(d) {
   $('usStats').innerHTML =
     usStat(fmtTok(t.requests), '请求数') +
     usStat(fmtTok(t.total_tokens), '总 token') +
+    usStat(fmtCredits(t.credits), '积分消耗') +
     usStat(fmtTok(t.prompt_tokens), 'prompt') +
     usStat(fmtTok(t.completion_tokens), 'completion') +
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
@@ -2077,6 +2097,25 @@ function renderUsage(d) {
 
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
     usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+
+  // 积分消耗表（v1.16.9）：按品牌列出窗口内实测扣费。占比 = 该品牌 / 全部品牌之和；
+  // 单价按**每百万 token**折算（实测 146M token 只花 0.7 积分，按千折算一律
+  // 显示 0.0000，横向比不出贵贱）。跨模型混合均价，只用于品牌间比较。
+  const brands = (d.by_brand || []).slice().sort((a, b) => (b.credits || 0) - (a.credits || 0));
+  const credSum = brands.reduce((a, x) => a + (x.credits || 0), 0);
+  $('usCreditBody').innerHTML = brands.length ? brands.map(x => {
+    const c = Number(x.credits || 0);
+    const pct = credSum > 0 ? (c / credSum * 100) : 0;
+    const perM = x.total_tokens > 0 ? (c / x.total_tokens * 1e6) : null;
+    return '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td>' + brandBadge(displayBrand(x.key, x.realm)) + '</td>' +
+      '<td class="num">' + fmtCredits(c) + '</td>' +
+      '<td class="num" title="占窗口内全部品牌积分消耗的比例">' + (credSum > 0 ? pct.toFixed(1) + '%' : '—') + '</td>' +
+      '<td class="num">' + fmtTok(x.requests) + '</td>' +
+      '<td class="num">' + (perM === null ? '—' : fmtCredits(perM)) + '</td>' +
+      '</tr>';
+  }).join('') : '<tr><td colspan="6" class="empty">所选窗口内没有积分消耗记录（从下一次请求起开始统计）</td></tr>';
 
   renderUsageChart(d);
 }
@@ -2121,12 +2160,18 @@ function usPointLabel(ms, withHour) {
 function usAxisLabel(ms, withHour) { return usPointLabel(ms, withHour); }
 
 /* usParsePoints 把一组后端点解析成 [{t, tt, req}]，时间解析不出来的直接丢
-   （NaN 会传染整张图）。tt 优先用上游给的 total，缺了用 pt+ct 兜底。 */
-function usParsePoints(points) {
+   （NaN 会传染整张图）。metric=token 时 tt 优先用上游给的 total，缺了用 pt+ct
+   兜底；metric=credit 时 tt 取 credits（上游实测扣费，缺省 0）。 */
+function usParsePoints(points, metric) {
   const out = [];
+  const byCredit = metric === 'credit';
   for (const p of (points || [])) {
     const t = parsePointTime(p);
     if (t === null) continue;
+    if (byCredit) {
+      out.push({ t, tt: Number(p.credits || 0), req: p.requests || 0, scope: p.scope });
+      continue;
+    }
     const pt = Number(p.prompt_tokens || 0);
     const ct = Number(p.completion_tokens || 0);
     out.push({ t, tt: Number(p.total_tokens || 0) || (pt + ct), req: p.requests || 0, scope: p.scope });
@@ -2204,27 +2249,30 @@ function usColorScheme(names) {
   return out;
 }
 
-/* usFigState 跨重渲染保留的图表状态：模式（全部/按模型/按 key）与图例开关。
-   loadUsage 每次拉数据后重画；模式切换只重画不重新拉接口（数据已在 usLastUsage）。 */
+/* usFigState 跨重渲染保留的图表状态：指标（token/积分）、模式（全部/按模型/按品牌/按 key）
+   与图例开关。loadUsage 每次拉数据后重画；切换只重画不重新拉接口（数据已在 usLastUsage）。 */
 let usLastUsage = null;
-const usFigState = { mode: 'total', selected: {} };
+const usFigState = { metric: 'token', mode: 'total', selected: {} };
 
-/* usModeValueSeries 按当前模式取「待画的命名系列」。
-   total: [{name:'总 token', pts: 总序列}]（单线）
+/* usModeValueSeries 按当前指标 + 模式取「待画的命名系列」。
+   metric=token 用 total_tokens；metric=credit 用 credits（v1.16.9，上游实测扣费）。
+   两者来自同一批桶、同一套时间片，只是取哪个字段。
+   total: [{name:'总 token'|'总积分', pts: 总序列}]（单线）
    model: model_series 的每个模型一条线
    brand: brand_series 的每个品牌一条线（品牌由后端按 realm 派生，天然有界）
    key:   key_series 同理；空 key 桶（无归因）后端就不返回，天然不出现 */
 function usModeValueSeries(snap) {
+  const metric = usFigState.metric;
   const bagOf = { model: 'model_series', brand: 'brand_series', key: 'key_series' };
   if (bagOf[usFigState.mode]) {
     const bag = snap[bagOf[usFigState.mode]] || {};
     const list = [];
     for (const name of Object.keys(bag)) {
-      list.push({ name, pts: usParsePoints(bag[name]) });
+      list.push({ name, pts: usParsePoints(bag[name], metric) });
     }
     return list;
   }
-  return [{ name: '总 token', pts: usParsePoints(snap.series || []) }];
+  return [{ name: metric === 'credit' ? '总积分' : '总 token', pts: usParsePoints(snap.series || [], metric) }];
 }
 
 /* usFigSeries 把命名系列的网格数据转成 ECharts series 数组（每系列一色）。
@@ -2250,8 +2298,20 @@ function usFigSeries(named, grid, isMulti) {
       base.symbolSize = (val, pp) => pp.dataIndex === usPeakIdx(data) ? 7 : 0;
       base.areaStyle = { color, opacity: 0.08 };
     } else {
-      base.symbolSize = 4;
-      base.showSymbol = false;
+      // 多线：默认不画点（否则 11 条线全是点，噪声盖过趋势）。但**非零点很少时
+      // 必须画点**——积分模式常常整窗只有一两小时有扣费，线条几乎为 0 且没有
+      // 点，画面上什么都看不到（实测线上：152M token 只扣 2.77 分，全在最后一小时）。
+      const nonzero = data.filter(d => d[1] > 0).length;
+      if (nonzero > 0 && nonzero <= 24) {
+        base.showSymbol = true;
+        base.symbolSize = 5;
+        base.symbolBorderWidth = 0;
+      } else {
+        base.showSymbol = false;
+      }
+      // 不裁剪到绘图区：数据点落在窗口两端（最常见是「刚刚这一小时」）时，
+      // 实心圆点会被 grid 右边界切掉一半，看着像没有线（v1.16.11 实测）。
+      base.clip = false;
     }
     return base;
   });
@@ -2276,11 +2336,15 @@ function renderUsageChart(snap) {
   usLastUsage = snap;
 
   const named = usModeValueSeries(snap);
+  const metric = usFigState.metric;
+  const isCredit = metric === 'credit';
   let anyPts = false;
   for (const s of named) if (s.pts.length) { anyPts = true; break; }
   if (!anyPts) {
     disposeUsChart();
-    host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
+    host.innerHTML = '<div class="us-empty">' +
+      (isCredit ? '所选窗口内没有积分消耗记录（老数据无扣费明细，新请求起才有）。' : '暂无用量数据。发起一次对话后再刷新。') +
+      '</div>';
     if ($('usFigNote')) $('usFigNote').textContent = '';
     return;
   }
@@ -2327,7 +2391,9 @@ function renderUsageChart(snap) {
     // 绘图区顶部不再为 tooltip 预留大片空白：tooltip 现在是贴顶的紧凑浮层，
     // 多系列模式下曲线基本贴底，空出的顶部它可以直接盖住（v1.15.8 前留 108px
     // 导致图上方一大片空白）。单/多模式一致 top:24。
-    grid: { left: 56, right: 20, top: 24, bottom: isMulti ? usLegendEstimate(named.map(s => s.name), hostW) : 32 },
+    // right 留 26px：时间轴右端就是「当前这一小时」，最后一个数据点若画在右边界
+    // 上会被纵向裁掉一半（v1.16.11 前 right:20，实测点被切）。左端同理由 left:56 覆盖。
+    grid: { left: 56, right: 26, top: 24, bottom: isMulti ? usLegendEstimate(named.map(s => s.name), hostW) : 32 },
     legend: {
       show: isMulti, bottom: 0, type: 'plain',
       icon: 'circle', itemWidth: 8, itemHeight: 8, itemGap: 14,
@@ -2380,9 +2446,10 @@ function renderUsageChart(snap) {
           '<div style="display:flex;justify-content:space-between;gap:18px">' +
           '<span>' + name + '</span><b' + (valStyle ? ' style="' + valStyle + '"' : '') + '>' + val + '</b></div>';
         if (!isMulti) {
-          // value = [时间戳, 总token, 请求数]
-          return esc(whenOf(v[0])) +
-                 row('总 token', fmtTok(v[1]) + (v[2] ? '（' + v[2] + ' 次）' : ''));
+          // value = [时间戳, 数值, 请求数]
+          const label = isCredit ? '总积分' : '总 token';
+          const val = isCredit ? fmtCredits(v[1]) : fmtTok(v[1]);
+          return esc(whenOf(v[0])) + row(label, val + (v[2] ? '（' + v[2] + ' 次）' : ''));
         }
         // 多系列：只列当前时刻**有值**的系列（0 值不列，否则每条竖线都刷 11 行），
         // 按数值降序；最多 6 行（再多浮层过高），其余折叠成提示。
@@ -2397,12 +2464,12 @@ function renderUsageChart(snap) {
         rows.sort((a, b) => b.tt - a.tt);
         const shown = rows.slice(0, 6);
         for (const r of shown) {
-          html += row(esc(r.name), fmtTok(r.tt));
+          html += row(esc(r.name), isCredit ? fmtCredits(r.tt) : fmtTok(r.tt));
         }
         if (rows.length > shown.length) {
-          html += '<div style="opacity:.65">…另有 ' + (rows.length - shown.length) + ' 项（该时刻共 ' + rows.length + ' 个模型有用量）</div>';
+          html += '<div style="opacity:.65">…另有 ' + (rows.length - shown.length) + ' 项（该时刻共 ' + rows.length + ' 项有数据）</div>';
         }
-        if (!rows.length) html += '<div style="opacity:.65">该时刻无用量</div>';
+        if (!rows.length) html += '<div style="opacity:.65">该时刻无' + (isCredit ? '积分消耗' : '用量') + '</div>';
         return html;
       }
     },
@@ -2420,7 +2487,8 @@ function renderUsageChart(snap) {
     yAxis: {
       type: 'value',
       axisLabel: {
-        formatter: fmtTok,                   // 0 / 12.5k / 25M…带 k/M 缩写
+        // 积分用 fmtCredits（带小数，量级小），token 用 fmtTok（k/M 缩写）
+        formatter: isCredit ? fmtCredits : fmtTok,
         color: INK, fontSize: 11.5
       },
       splitLine: { lineStyle: { color: GRID } },
@@ -2461,10 +2529,16 @@ function renderUsageChart(snap) {
 
   // 单线模式的图例色被 canvas 接管，header 不再写死色块。
   const cap = { total: '全部消耗', model: '按模型', brand: '按品牌', key: '按 Key' }[usFigState.mode] || '';
-  if ($('usChartLabel')) $('usChartLabel').textContent = 'Token 时序 · ' + cap;
+  if ($('usChartLabel')) {
+    $('usChartLabel').textContent = (isCredit ? '积分消耗时序 · ' : 'Token 时序 · ') + cap;
+  }
   if ($('usFigNote')) {
     let note = '';
-    if (isMulti) {
+    if (isCredit) {
+      note = isMulti
+        ? '共 ' + named.length + ' 条系列（按品牌的实测扣费积分，点击图例可开关）。'
+        : '曲线为该时段实测扣费积分之和（上游 usage.credit）。';
+    } else if (isMulti) {
       const other = named.find(s => s.name === US_OTHER_NAME);
       note = '共 ' + named.length + ' 条系列（每系列一色，点击图例可开关）' +
              (other ? '；小量维度已并入「其他」' : '') + '。';
@@ -2563,6 +2637,34 @@ if ($('usModes')) $('usModes').addEventListener('click', ev => {
   if (!b) return;
   usFigState.mode = b.dataset.mode;
   $('usModes').querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c === b));
+  if (usLastUsage) renderUsageChart(usLastUsage);
+});
+
+/* 指标切换（Token / 积分消耗）：同一份快照换 y 值字段重画，不重新拉接口。
+   切到积分时把模式收窄到「按品牌」——用户的需求就是「积分按品牌看」；
+   token 模式保留原来的全部/模型/品牌/key 四种。 */
+if ($('usMetric')) $('usMetric').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-metric]');
+  if (!b) return;
+  const metric = b.dataset.metric;
+  if (usFigState.metric === metric) return;
+  usFigState.metric = metric;
+  $('usMetric').querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c === b));
+
+  // 积分指标只保留「全部消耗」与「按品牌」两个模式：按模型/按 Key 的积分
+  // 明细同样有数据，但用户这里的诉求是品牌维度，先把噪声收掉。
+  const modes = $('usModes');
+  if (modes) {
+    const allow = metric === 'credit' ? ['total', 'brand'] : ['total', 'model', 'brand', 'key'];
+    modes.querySelectorAll('button[data-mode]').forEach(btn => {
+      btn.hidden = !allow.includes(btn.dataset.mode);
+    });
+    // 切到积分时默认按品牌（用户诉求就是「积分按品牌看」）；切回 token 保留原模式。
+    if (metric === 'credit') usFigState.mode = 'brand';
+    else if (!allow.includes(usFigState.mode)) usFigState.mode = 'total';
+    modes.querySelectorAll('button[data-mode]').forEach(btn =>
+      btn.classList.toggle('on', btn.dataset.mode === usFigState.mode));
+  }
   if (usLastUsage) renderUsageChart(usLastUsage);
 });
 

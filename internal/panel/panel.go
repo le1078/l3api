@@ -15,6 +15,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -296,10 +297,12 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	for _, st := range p.cfg.Pool.List() {
 		inFlight += st.InFlight
 	}
-	// 今日产出（usage 可能未启用，零值即可）。
+	// 今日产出（usage 可能未启用，零值即可）。今日积分消耗与这两个数同一次
+	// 扫描取回（v1.16.9）：顶部「积分剩余 / 总额」卡要同时展示今日消耗。
 	var todayReq, todayTok int64
+	var todayCred float64
 	if p.cfg.Usage != nil {
-		todayReq, todayTok = p.cfg.Usage.TodayTotals()
+		todayReq, todayTok, todayCred = p.cfg.Usage.TodaySummary()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
@@ -315,7 +318,11 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"in_flight":       inFlight,
 		"today_requests":  todayReq,
 		"today_tokens":    todayTok,
-		"accounts":        p.accountsView(),
+		// today_credits 今日积分消耗（今日小时桶里 usage.credit 之和，v1.16.9）。
+		// 保留两位小数：上游 credit 是小数，浮点累加后的尾数（12.340000000002）
+		// 直接透出会让前端格式化很别扭。
+		"today_credits": math.Round(todayCred*100) / 100,
+		"accounts":      p.accountsView(),
 	})
 }
 

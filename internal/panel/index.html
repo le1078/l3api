@@ -202,6 +202,9 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
 .stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
 .stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
+/* 卡片副行（积分卡的「今日消耗」）：比主标签更轻，数字用语义色强调消耗。 */
+.stat .sub { color: var(--ink-3); font-size: 11.5px; margin-top: 2px; white-space: nowrap; }
+.stat .sub b { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--warn); }
 .stat.good .v { color: var(--ok); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
 
 /* ── 面板块 ───────────────────────────────────────────────────────── */
@@ -768,7 +771,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
            卡片语义分工：存量（积分）→ 产出（今日请求/Token）→ 负载（在途）
            → 会话（粘性）。 -->
       <div class="stats">
-        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
+        <!-- 积分卡同时给「剩余 / 总额」与「今日消耗」：存量与产出放一起，
+             避免为一个小数字再加一张卡（5 卡在 1500px 下会把每卡挤窄）。 -->
+        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div>
+          <div class="sub">今日消耗 <b id="sCreditsToday">-</b></div></div>
         <div class="stat"><div class="v" id="sToday">-</div><div class="k">今日请求 · Token</div></div>
         <div class="stat"><div class="v" id="sInFlight">-</div><div class="k">在途请求</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
@@ -921,17 +927,38 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="uschart-hd">
               <span class="lb" id="usChartLabel">Token 时序 · 全部消耗</span>
               <span class="grow"></span>
-              <span class="chips" id="usModes">
-                <button class="xs chip on" data-mode="total">全部消耗</button>
-                <button class="xs chip" data-mode="model">按模型</button>
-                <button class="xs chip" data-mode="brand">按品牌</button>
-                <button class="xs chip" data-mode="key">按 Key</button>
-              </span>
+          <span class="chips" id="usMetric">
+            <button class="xs chip on" data-metric="token">Token</button>
+            <button class="xs chip" data-metric="credit">积分消耗</button>
+          </span>
+          <span class="chips" id="usModes">
+            <button class="xs chip on" data-mode="total">全部消耗</button>
+            <button class="xs chip" data-mode="model">按模型</button>
+            <button class="xs chip" data-mode="brand">按品牌</button>
+            <button class="xs chip" data-mode="key">按 Key</button>
+          </span>
             </div>
             <!-- ECharts 需要显式高度（容器 height:100% 在嵌套盒里拿不到父高） -->
             <div id="usChart" class="uschart-body ec-body"></div>
             <div class="uschart-ft" id="usFigNote"></div>
           </div>
+        </div>
+      </div>
+
+      <!-- 积分消耗（v1.16.9）：按品牌列出窗口内实测扣费。数据来自每次请求上游
+           末帧 usage.credit，与顶部「今日消耗」同源（那个是今日全天，这里是所选窗口）。 -->
+      <div class="box">
+        <header><h3>积分消耗</h3><span class="grow"></span>
+          <span class="note">按品牌 · 上游实测扣费</span></header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th><th>品牌</th>
+              <th class="num">消耗积分</th><th class="num">占比</th>
+              <th class="num">请求</th><th class="num">每百万 token 积分</th>
+            </tr></thead>
+            <tbody id="usCreditBody"></tbody>
+          </table>
         </div>
       </div>
 
@@ -1426,6 +1453,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div id="toasts"></div>
 
 <script src="echarts.min.js"></script>
-<script src="app.js?v=1.16.8"></script>
+<script src="app.js?v=1.16.12"></script>
 </body>
 </html>

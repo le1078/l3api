@@ -61,6 +61,12 @@ type bucket struct {
 	LatN  int64   `json:"ln"` // 延迟样本数
 	TPS   float64 `json:"v"`  // 吐字速率累计
 	TPSN  int64   `json:"vn"` // 速率样本数
+	// Cred 积分消耗累计（v1.16.9）。来源是上游末帧 usage.credit（本次真实扣费），
+	// 与 pool.NoteModelCost 同一份数据——那边只用来扣余额/算单价，不落时间维度。
+	// 用 float 而非 int：上游下发的是小数（如 0.37），整型会在分桶累加前丢精度；
+	// 单桶最多累加 90 天，float64 精度足够。
+	// 老 usage.json 无此字段 → 反序列化为 0，零迁移（历史消耗无法补记，如实为 0）。
+	Cred float64 `json:"cr,omitempty"`
 }
 
 // file 落盘结构。
@@ -150,6 +156,11 @@ type Delta struct {
 	HasLatency       bool
 	TokensPerSecond  float64
 	HasTPS           bool
+	// Credit 本次上游真实扣费积分（末帧 usage.credit）。HasCredit=false 表示上游
+	// 没给这个字段（老上游/非计费端点），此时不动累计值——**不能按 0 计入**：
+	// 0 也是合法观测（免费请求），"没给"与"给了 0"必须区分。
+	Credit    float64
+	HasCredit bool
 }
 
 // Add 记录一次请求尝试（无 key 归因的旧入口，等价 AddKey(k="")）。
@@ -218,6 +229,48 @@ func (r *Recorder) AddKey(now time.Time, realm, uid, model, key string, d Delta,
 		b.TPS += d.TokensPerSecond
 		b.TPSN++
 	}
+	if d.HasCredit {
+		b.Cred += d.Credit
+	}
+	r.dirty = true
+}
+
+// AddCredit 把一次请求的**积分消耗**（上游末帧 usage.credit）记进对应的时间分桶。
+//
+// 与 AddKey 分开的原因：credit 只有在流/聚合结束后才拿得到（末帧 usage），而
+// AddKey 在「本次尝试结束」时就要记账（成功失败都要算请求数）。两条路径的时机
+// 与语义都不同，合并会让 AddKey 多一个「有时有、有时没有」的参数。
+//
+// 只累加 credit 到已存在的逻辑桶（scope+realm+uid+model+key 同形）；桶不存在时
+// 新建一个（Req=0）——极端情况下先记 credit 也不可能发生（同一请求先 AddKey），
+// 但建桶比丢弃数据安全。credit<=0 时仍写入（0 是有效观测，但无意义，直接跳过
+// 省一次 map 查找；免费请求的 0 不影响任何合计）。
+//
+// 归因口径必须与 AddKey 完全一致（realm/uid/model/key 逐字段相同），否则同一请求
+// 的 token 与积分会落在两个桶里，按品牌/账号聚合时对不上。
+func (r *Recorder) AddCredit(now time.Time, realm, uid, model, key string, credit float64) {
+	if r == nil || credit <= 0 {
+		return
+	}
+	if realm == "" {
+		realm = "cn"
+	}
+	if model == "" {
+		model = "(unknown)"
+	}
+	model = strings.ReplaceAll(model, "\x00", "")
+	uid = strings.ReplaceAll(uid, "\x00", "")
+	key = strings.ReplaceAll(key, "\x00", "")
+	bucketKey := bucketMapKey("h:"+now.Format(hourLayout), realm, uid, model, key)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b := r.buckets[bucketKey]
+	if b == nil {
+		b = &bucket{Scope: "h:" + now.Format(hourLayout), Realm: realm, UID: uid, Model: model, Key: key}
+		r.buckets[bucketKey] = b
+	}
+	b.Cred += credit
 	r.dirty = true
 }
 
@@ -271,6 +324,7 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.TT += src.TT
 			dst.LatMs += src.LatMs
 			dst.LatN += src.LatN
+			dst.Cred += src.Cred
 			dst.TPS += src.TPS
 			dst.TPSN += src.TPSN
 		}
@@ -366,6 +420,9 @@ type Agg struct {
 	TotalTokens   int64   `json:"total_tokens"`
 	AvgLatencyMs  float64 `json:"avg_latency_ms"`
 	AvgTPS        float64 `json:"avg_tokens_per_second"`
+	// Credits 积分消耗累计（v1.16.9，上游 usage.credit 实测扣费之和）。
+	// 口径：只在「上游真的下发了 credit」的请求上累加，老数据/免费请求为 0。
+	Credits float64 `json:"credits"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -384,6 +441,7 @@ func (g *aggAcc) add(b *bucket) {
 	g.PromptTokens += b.PT
 	g.CompletionTok += b.CT
 	g.TotalTokens += b.TT
+	g.Credits += b.Cred
 	g.latSum += b.LatMs
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
@@ -425,7 +483,11 @@ type Snapshot struct {
 	ByModel        []KeyedAgg `json:"by_model"`
 	ByModelAccount []KeyedAgg `json:"by_model_account"` // 按 (账号×模型) 拆分，每条记录带品牌+昵称
 	ByApiKey       []KeyedAgg `json:"by_api_key"`       // 按 API Key 名拆分（v1.11 多租户归因；空 = 无 key 桶）
-	Series         []Point    `json:"series"`
+	// ByBrand 按品牌聚合（v1.16.9）：品牌键与品牌时序同口径（见 usageBrand），
+	// 供「用量」页的积分消耗统计表使用——用户要看的是「每个品牌烧了多少积分」，
+	// 而不是按 realm 的 cn/global 原始值。
+	ByBrand []KeyedAgg `json:"by_brand"`
+	Series  []Point    `json:"series"`
 
 	// ModelSeries / KeySeries 是**逐维度**的时序（v1.15.4）：
 	//   map[模型名][]Point / map[key 名][]Point，时间片与 Series 同构（窗口内小时点 +
@@ -438,10 +500,14 @@ type Snapshot struct {
 	// 就是品牌名（qoder/trae），codebuddy 的 cn/global 归一为 codebuddy——无额外
 	// 持久化字段，老 usage.json 直接可用，零迁移。
 	BrandSeries map[string][]Point `json:"brand_series,omitempty"`
-	Buckets     int                `json:"buckets"`
-	FileBytes   int64              `json:"file_bytes"`
-	Since       string             `json:"since,omitempty"`
-	Generated   string             `json:"generated"`
+	// 积分消耗时序不单独出一份：BrandSeries 的每个 Point 已经带完整 Agg（含
+	// Credits），前端按品牌画积分曲线时直接读同一条序列的 credits 字段即可——
+	// 同一份时间轴/品牌集合，只是 y 值换成积分（2026-10-18 设计取舍：
+	// 不重复传输一份形状完全相同的数据）。
+	Buckets   int    `json:"buckets"`
+	FileBytes int64  `json:"file_bytes"`
+	Since     string `json:"since,omitempty"`
+	Generated string `json:"generated"`
 
 	// 时序窗口（面板按所选「近 N 小时/天」画 x 轴用）。WindowFrom/WindowTo 是本地
 	// 小时格式（与 Point.T 的 hour 形态同形，"2006-01-02T15"），左闭右闭。
@@ -460,8 +526,16 @@ type Snapshot struct {
 // 只扫小时桶：今天的桶必然还是 h: 粒度（日粒度折叠只发生在更老的历史上）。
 // TT 是上游给的合计口径，缺失时（老桶）退 PT+CT。
 func (r *Recorder) TodayTotals() (requests, tokens int64) {
+	requests, tokens, _ = r.TodaySummary()
+	return requests, tokens
+}
+
+// TodaySummary 今日请求数、token 合计与**积分消耗**（v1.16.9），一次扫描取齐。
+// 面板顶部「积分剩余 / 总额」卡要同时展示剩余与今日消耗，两卡共用这一次扫描，
+// 避免同一批桶扫两遍。Credits 只累加「上游真的下发了 credit」的桶。
+func (r *Recorder) TodaySummary() (requests, tokens int64, credits float64) {
 	if r == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	prefix := "h:" + time.Now().Format(dayLayout)
 	r.mu.Lock()
@@ -476,8 +550,9 @@ func (r *Recorder) TodayTotals() (requests, tokens int64) {
 		} else {
 			tokens += b.PT + b.CT
 		}
+		credits += b.Cred
 	}
-	return requests, tokens
+	return requests, tokens, credits
 }
 
 func (r *Recorder) Snapshot(hours int, nicks, brands map[string]string) Snapshot {
@@ -502,6 +577,7 @@ func (r *Recorder) Snapshot(hours int, nicks, brands map[string]string) Snapshot
 	modelAgg := map[string]*aggAcc{}
 	modelAcctAgg := map[string]*aggAcc{} // 按 (uid\x00model) 拆分，供 by_model_account 维度
 	keyAgg := map[string]*aggAcc{}       // 按 API Key 名拆分（v1.11）
+	brandAgg := map[string]*aggAcc{}     // 按品牌聚合（v1.16.9）
 	hourSeries := map[string]*aggAcc{}
 	daySeries := map[string]*aggAcc{}
 	// 逐维度时序（v1.15.4）：与 hourSeries/daySeries 同一时间分片，另按 model / key
@@ -575,6 +651,12 @@ func (r *Recorder) Snapshot(hours int, nicks, brands map[string]string) Snapshot
 				}
 				keyAgg[b.Key].add(b)
 			}
+
+			// 按品牌聚合（v1.16.9）：键口径与品牌时序完全一致（usageBrand）。
+			if brandAgg[usageBrand(b.Realm)] == nil {
+				brandAgg[usageBrand(b.Realm)] = &aggAcc{}
+			}
+			brandAgg[usageBrand(b.Realm)].add(b)
 		}
 
 		// dimAdd 把一个桶累加进 (维度值, 时间片) 的序列格。
@@ -636,6 +718,7 @@ func (r *Recorder) Snapshot(hours int, nicks, brands map[string]string) Snapshot
 		}),
 		ByModel:     keyed(modelAgg, func(k string) (string, string) { return k, "" }),
 		ByApiKey:    keyed(keyAgg, func(k string) (string, string) { return k, "" }),
+		ByBrand:     keyed(brandAgg, func(k string) (string, string) { return k, "" }),
 		Buckets:     len(bs),
 		Generated:   time.Now().Format(time.RFC3339),
 		WindowFrom:  hourFrom.Format(hourLayout),
@@ -814,6 +897,7 @@ func buildDimSeries(hour, day map[string]map[string]*aggAcc, top map[string]bool
 		dst.PromptTokens += acc.PromptTokens
 		dst.CompletionTok += acc.CompletionTok
 		dst.TotalTokens += acc.TotalTokens
+		dst.Credits += acc.Credits
 		dst.latSum += acc.latSum
 		dst.latSamples += acc.latSamples
 		dst.tpsSum += acc.tpsSum

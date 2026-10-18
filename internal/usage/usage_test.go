@@ -288,3 +288,111 @@ func TestTodayTotals(t *testing.T) {
 		t.Errorf("tokens=%d want 150（100 + 30+20 回退）", tok)
 	}
 }
+
+// TestCreditRecording 积分消耗（v1.16.9）：AddCredit 累加进与 AddKey 相同的逻辑桶，
+// 因此按品牌/账号/模型聚合都能看到 credits；今日汇总也只算今天的小时桶。
+func TestCreditRecording(t *testing.T) {
+	r := New("")
+	now := time.Now()
+
+	// 同一请求：先记 token（AddKey），再记扣费（AddCredit）——归因字段必须一致。
+	r.AddKey(now, "cn", "u1", "glm-5.2", "", Delta{TotalTokens: 100, HasTotal: true}, true)
+	r.AddCredit(now, "cn", "u1", "glm-5.2", "", 1.5)
+
+	r.AddKey(now, "global", "u2", "kimi-k3", "", Delta{TotalTokens: 200, HasTotal: true}, true)
+	r.AddCredit(now, "global", "u2", "kimi-k3", "", 0.25)
+
+	// 免费请求：credit=0 → AddCredit 直接跳过，不影响合计。
+	r.AddKey(now, "qoder", "u3", "auto", "", Delta{TotalTokens: 50, HasTotal: true}, true)
+	r.AddCredit(now, "qoder", "u3", "auto", "", 0)
+
+	// 昨天：不进今日汇总，但仍进窗口内聚合（24h 窗口可能刚好跨过它，用 48h 验证）。
+	y := now.Add(-30 * time.Hour)
+	r.AddKey(y, "cn", "u1", "glm-5.2", "", Delta{TotalTokens: 10, HasTotal: true}, true)
+	r.AddCredit(y, "cn", "u1", "glm-5.2", "", 9)
+
+	s := r.Snapshot(48, nil, nil)
+	if got := s.Totals.Credits; got != 1.75+9 {
+		t.Fatalf("totals.credits = %v, want 10.75", got)
+	}
+	// 按品牌：cn → codebuddy，global → codebuddy-global，qoder → qoder
+	want := map[string]float64{"codebuddy": 1.5 + 9, "codebuddy-global": 0.25, "qoder": 0}
+	for _, row := range s.ByBrand {
+		if w, ok := want[row.Key]; ok && row.Credits != w {
+			t.Errorf("by_brand[%s].credits = %v, want %v", row.Key, row.Credits, w)
+		}
+		delete(want, row.Key)
+	}
+	for k := range want {
+		t.Errorf("by_brand 缺品牌 %s", k)
+	}
+	// 按账号：u1 应把 token 与积分都记在同一行（同桶验证）
+	for _, row := range s.ByAccount {
+		if row.Key == "u1" {
+			if row.Credits != 10.5 {
+				t.Errorf("by_account[u1].credits = %v, want 10.5", row.Credits)
+			}
+			if row.TotalTokens != 110 {
+				t.Errorf("by_account[u1].tokens = %d, want 110（同桶，token 与积分不可分裂）", row.TotalTokens)
+			}
+		}
+	}
+	// 品牌时序：credit 跟着品牌序列走（前端按品牌画积分曲线直接读该字段）
+	bs := s.BrandSeries["codebuddy"]
+	if len(bs) == 0 {
+		t.Fatal("brand_series[codebuddy] 为空")
+	}
+	var sum float64
+	for _, p := range bs {
+		sum += p.Credits
+	}
+	if sum != 10.5 {
+		t.Errorf("brand_series[codebuddy] credits 合计 = %v, want 10.5", sum)
+	}
+
+	// 今日汇总：昨天那 9 分不算
+	_, _, todayCred := r.TodaySummary()
+	if todayCred != 1.75 {
+		t.Errorf("today credits = %v, want 1.75", todayCred)
+	}
+}
+
+// TestCreditRollup 小时桶折叠为日桶时 credit 必须一起搬过去（否则 90 天前的
+// 消耗会在折叠后凭空消失）。
+func TestCreditRollup(t *testing.T) {
+	r := New("")
+	old := time.Now().Add(-(hourlyKeep + 24*time.Hour))
+	r.AddKey(old, "cn", "u1", "m", "", Delta{TotalTokens: 10, HasTotal: true}, true)
+	r.AddCredit(old, "cn", "u1", "m", "", 3.25)
+
+	r.Rollup(time.Now())
+
+	for _, b := range r.buckets {
+		if b.Scope == "h:"+old.Format(hourLayout) {
+			t.Fatal("旧小时桶未被折叠")
+		}
+	}
+	var got float64
+	for _, b := range r.buckets {
+		got += b.Cred
+	}
+	if got != 3.25 {
+		t.Fatalf("折叠后 credits = %v, want 3.25", got)
+	}
+}
+
+// TestCreditPersist 落盘/加载后 credit 不丢（老文件无 cr 字段 → 0，零迁移）。
+func TestCreditPersist(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.json")
+	r := New(path)
+	r.AddKey(time.Now(), "cn", "u1", "m", "", Delta{TotalTokens: 10, HasTotal: true}, true)
+	r.AddCredit(time.Now(), "cn", "u1", "m", "", 2.5)
+	r.Save()
+
+	r2 := New(path)
+	_, _, cred := r2.TodaySummary()
+	if cred != 2.5 {
+		t.Fatalf("重载后 credits = %v, want 2.5", cred)
+	}
+}

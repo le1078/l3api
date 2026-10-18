@@ -853,6 +853,31 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 			unbindSticky()
 		}
 	}
+	// usageRealm 归账域：品牌账号按品牌名归账（其 Realm 恒归一为 cn，直用会把
+	// qoder/trae 用量混进 cn 视图）；codebuddy 账号按 Realm（cn/global）。
+	// 只在池状态里查一次——recordAttempt 与 recordCredit 共用同一口径，否则同一
+	// 请求的 token 与积分会落进不同桶（按品牌聚合时对不上）。
+	usageRealm := func(uid string) string {
+		attemptRealm := "cn"
+		if a, ok := h.cfg.Pool.Status(uid); ok {
+			if a.Brand != "" && a.Brand != "codebuddy" {
+				attemptRealm = a.Brand
+			} else if a.Realm != "" {
+				attemptRealm = a.Realm
+			}
+		}
+		return attemptRealm
+	}
+	// recordCredit 记录本次请求的积分消耗（上游末帧 usage.credit）。独立于
+	// recordAttempt：credit 要等流结束/聚合完成才拿得到，而请求数在尝试结束时
+	// 就已记账。归因字段与 recordAttempt 逐字段相同（见 usageRealm）。
+	recordCredit := func(uid string, credit float64) {
+		if h.cfg.Usage == nil || credit <= 0 {
+			return
+		}
+		h.cfg.Usage.AddCredit(time.Now(), usageRealm(uid), uid, reqModel, apiKeyName, credit)
+	}
+
 	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time) {
 		delta.Model = reqModel
 		latency := time.Since(started)
@@ -870,16 +895,7 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 
 		// 归账域只查一次池状态（此前指标与用量各查一次 Status——每次上游尝试
 		// 两次进池锁 + 两次全量 Status 构造，2026-10-13 合并为一次）。
-		// 口径：品牌账号按品牌名归账（其 Realm 恒归一为 cn，直用会把 qoder/trae
-		// 用量混进 cn 视图）；codebuddy 账号按 Realm（cn/global）。
-		attemptRealm := "cn"
-		if a, ok := h.cfg.Pool.Status(uid); ok {
-			if a.Brand != "" && a.Brand != "codebuddy" {
-				attemptRealm = a.Brand
-			} else if a.Realm != "" {
-				attemptRealm = a.Realm
-			}
-		}
+		attemptRealm := usageRealm(uid)
 
 		// 尝试计数（v1.11）：成功/失败都算一次上游尝试（含换号重试），运维据此
 		// 看到重试放大。
@@ -1199,7 +1215,10 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 			st.toks, _ = stats.Tokens()
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
+			// 积分消耗时序（v1.16.9）：只要上游下发了 credit 就记（与是否有
+			// total_tokens 无关——单价算不了也要让「今日消耗」对得上）。
 			if credit, ok := stats.Credit(); ok {
+				recordCredit(acct.UID, credit)
 				if total, tok := stats.TotalTokens(); tok && total > 0 {
 					h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 					h.noteFreeExhaust(acct.UID, bareModel, credit, guardPromo)
@@ -1247,8 +1266,12 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 		st.toks = completionTokens(resp)
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if credit, total, ok := usageCreditTotal(resp); ok {
+			recordCredit(acct.UID, credit)
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 			h.noteFreeExhaust(acct.UID, bareModel, credit, guardPromo)
+		} else if c, ok2 := responseCredit(resp); ok2 {
+			// 有 credit 但没有 total_tokens：单价算不了，积分消耗仍要记。
+			recordCredit(acct.UID, c)
 		}
 		return
 	}
@@ -1320,6 +1343,20 @@ func (h *Handler) noteFreeExhaust(uid, bareModel string, credit float64, promo *
 		return
 	}
 	h.cfg.Pool.MarkFreeExhausted(uid, bareModel, promo.NextReset(time.Now()))
+}
+
+// responseCredit 从聚合响应里只取 usage.credit（不看 total_tokens）。
+// 用于「有扣费但没 token 统计」的响应：单价算不了，积分消耗仍要记账。
+func responseCredit(resp map[string]any) (float64, bool) {
+	u, _ := resp["usage"].(map[string]any)
+	if u == nil {
+		return 0, false
+	}
+	c, ok := u["credit"].(float64)
+	if !ok || c <= 0 {
+		return 0, false
+	}
+	return c, true
 }
 
 // usageCreditTotal 从聚合响应取 usage.credit 与 total_tokens（成本台账非流式入口）。
