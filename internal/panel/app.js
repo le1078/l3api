@@ -1035,12 +1035,7 @@ async function loadLogs() {
     const d = await api('logs');
     const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
     box.innerHTML = entries.length
-      ? entries.map(e => {
-        const lvl = /error|失败|错误/.test(e.text) ? ' e' : /warn|冷却|熔断/.test(e.text) ? ' w' : '';
-        const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
-        const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
-        return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
-      }).join('')
+      ? entries.map(logEntryHTML).join('')
       : '<span style="color:var(--ink-3)">暂无日志</span>';
     if (logPin && atEnd) box.scrollTop = box.scrollHeight;
     const counts = {};
@@ -1049,6 +1044,57 @@ async function loadLogs() {
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
       : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
   } catch (e) { /* 概览已提示 */ }
+}
+
+/* logEntryHTML 渲染一条日志。
+   - 对话行（后端已解析成 row）：两行卡片——第一行「时间 · 完整模型名 · 状态 ·
+     序号」，第二行指标 chips（流式/同步、TTFB、tok、tok/s、总耗时）。行内那个
+     与 TS 重复的时刻**不再展示**（用户困惑「为什么每行两个时间」的根因）。
+   - 任务/系统行：等宽文本，保留终端质感与级别着色。
+   - row 缺失（老格式/解析失败）：退回原始文本，信息不丢。 */
+function logEntryHTML(e) {
+  // 时间只显示到秒：后端 TS 带纳秒，toLocaleTimeString 在 part 里会带毫秒尾巴。
+  // 日志扫读只需要「几点几分几秒」，毫秒纯噪音。
+  const t = e.ts
+    ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    : '';
+  const chBadge = logCh === 'all'
+    ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || esc(e.ch)) + '</i>'
+    : '';
+
+  if (e.ch === 'chat' && e.row) {
+    const r = e.row;
+    const ok = r.status >= 200 && r.status < 300;
+    // 慢请求以 8s 为线（实测 TTFB 常见 7–8s，再慢就是上游异常），标黄不标红：
+    // 失败才红，慢只是提醒。
+    const slow = ok && r.total_ms >= 8000;
+    const cls = ok ? (slow ? ' slow' : '') : ' err';
+    const statusCls = ok ? (slow ? 'warn' : 'ok') : 'bad';
+    const kv = (label, val, extra) =>
+      '<span class="kv' + (extra ? ' ' + extra : '') + '">' + label + '<b>' + esc(val) + '</b></span>';
+    let metrics = '';
+    metrics += kv('', r.mode === 'stream' ? '流式' : '同步', 'mute');
+    if (r.ttfb_ms > 0) metrics += kv('首字 ', fmtMs(r.ttfb_ms), r.ttfb_ms >= 8000 ? 'warn' : '');
+    if (r.tokens >= 0) {
+      metrics += kv('产出 ', fmtTok(r.tokens) + ' tok');
+      if (r.tok_s > 0) metrics += kv('', r.tok_s.toFixed(1) + ' tok/s');
+    } else {
+      metrics += '<span class="kv mute">无 usage</span>';
+    }
+    metrics += kv('总耗时 ', (r.total_ms / 1000).toFixed(1) + 's', slow ? 'warn' : '');
+    return '<span class="lg-chat' + cls + '">' +
+      '<span class="hd">' + chBadge +
+        '<span class="ts">' + esc(t) + '</span>' +
+        '<span class="mdl" title="' + esc(r.model) + '">' + esc(r.model) + '</span>' +
+        '<span class="kv ' + statusCls + '">' + r.status + '</span>' +
+        '<span class="seq">#' + r.seq + '</span>' +
+      '</span>' +
+      '<span class="bd">' + metrics + '</span>' +
+      '</span>';
+  }
+
+  const lvl = /error|失败|错误/.test(e.text) ? ' e' : /warn|冷却|熔断/.test(e.text) ? ' w' : '';
+  return '<span class="lg-line' + lvl + '">' + chBadge + esc(t + ' ' + e.text) + '</span>';
 }
 $('btnLogPin').onclick = () => {
   logPin = !logPin;
@@ -2017,6 +2063,13 @@ function fmtMs(ms) {
 }
 function fmtRate(r) { return r ? Number(r).toFixed(1) + ' tok/s' : '—'; }
 
+/* realmLabel 把网关内部域键换成人话（用量页所有展示位统一走这里）。
+   cn/global 是 codebuddy 的两套账号体系，qoder/trae 是品牌自己的池子；
+   空串 = 老数据没记域，显示「未知」而不是留白。 */
+function realmLabel(realm) {
+  return ({ cn: '国内版', global: '国际版', qoder: 'Qoder', trae: 'Trae' })[realm] || (realm || '未知');
+}
+
 function usStat(v, k, cls) {
   return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
          '</div><div class="k">' + esc(k) + '</div></div>';
@@ -2060,8 +2113,8 @@ function renderUsage(d) {
     usStat(fmtTok(t.requests), '请求数') +
     usStat(fmtTok(t.total_tokens), '总 token') +
     usStat(fmtCredits(t.credits), '积分消耗') +
-    usStat(fmtTok(t.prompt_tokens), 'prompt') +
-    usStat(fmtTok(t.completion_tokens), 'completion') +
+    usStat(fmtTok(t.prompt_tokens), '输入 token') +
+    usStat(fmtTok(t.completion_tokens), '输出 token') +
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
     usStat(fmtMs(t.avg_latency_ms), '平均延迟');
 
@@ -2073,14 +2126,14 @@ function renderUsage(d) {
 
   // 按账号用量同样按品牌分段（用量数据带 uid+realm，品牌用 BRAND_OF_UID 反查；
   // 后端只给 codebuddy 品牌名，靠 realm 拆国内/国际版——与账号池同口径）。
-  // 分隔行跨全部 10 列（与表头一致：mark/账号/域/请求/失败/Prompt/Completion/合计/均延迟/均速率）。
+  // 分隔行跨全部 10 列（与表头一致：mark/账号/域/请求/失败/输入/输出/合计/均延迟/均速率）。
   const accGroups = groupByBrand((d.by_account || []).map(x => ({ ...x, brand: displayBrand(x.brand || brandOfUID(x.key), x.realm) })));
   $('usAccBody').innerHTML = accGroups.map(s => {
     const sep = '<tr class="brand-sep"><td colspan="10">' + brandBadge(s.brand) +
       '<span class="brand-cnt">' + s.items.length + ' 个账号</span></td></tr>';
     const rows = s.items.map(x =>
       usRow(x.extra || x.key.slice(0, 8), x.key, x,
-        '<td class="num">' + esc(x.realm || '') + '</td>', true, brandBadge(x.brand))).join('');
+        '<td class="num">' + esc(realmLabel(x.realm)) + '</td>', true, brandBadge(x.brand))).join('');
     return sep + rows;
   }).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
 
@@ -2095,8 +2148,10 @@ function renderUsage(d) {
     return sep + rows;
   }).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
 
+  // 按域表：realm 是内部键（cn/global/qoder/trae），展示层一律换成人话——
+  // 用户不该为了看用量去记网关的内部域名字（v1.16.13）。
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(realmLabel(x.key), '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
 
   // 积分消耗表（v1.16.9）：按品牌列出窗口内实测扣费。占比 = 该品牌 / 全部品牌之和；
   // 单价按**每百万 token**折算（实测 146M token 只花 0.7 积分，按千折算一律

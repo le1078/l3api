@@ -268,14 +268,15 @@ func uidPrefix(uid string) string {
 
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
 // toks<0 表示 usage 缺失，显示 "-"。
+//
+// 模型名**不截断**（v1.16.13）：此前截到 11 个字符，`cn:deepseek-v4.1-flash`
+// 只剩 `cn:deepseek`，面板里根本分不清调的是哪个模型。完整名交给面板按列宽
+// 换行/省略；终端表格宽度由使用者自己调（日志是给人排障看的，宁可宽一点）。
 func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
 	if !chatLogEnabled {
 		return
 	}
 	seq := chatSeq.Add(1)
-	if len(model) > 11 {
-		model = model[:11]
-	}
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {
