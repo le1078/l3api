@@ -3,7 +3,7 @@ services:
     build: .
     # 显式钉住镜像 tag：不带 image 时 compose 用「目录名-service」默认 tag，
     # 升级时容易把容器重建回旧镜像（v1.15.4 踩过）。
-    image: l3api-cloud-v1168-2026-10-13-l3api:latest
+    image: l3api-cloud-v1168-unlimitedbody-2026-10-18-l3api:latest
     container_name: l3api
     restart: unless-stopped
     # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致

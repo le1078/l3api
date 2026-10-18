@@ -605,7 +605,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" data-row-uid="' + esc(s.uid) + '" title="点击查看账号详情">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (brandOf(s) !== 'codebuddy' ? ' <span class="brand-tag ' + esc(brandOf(s)) + '">' + (BRAND_LABEL[brandOf(s)] || brandOf(s)) + '</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' +
+      '<td class="who"><div class="nm nm-flex"><span class="nmtxt">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + '</span>' + (brandOf(s) !== 'codebuddy' ? '<span class="brand-tag ' + esc(brandOf(s)) + '">' + (BRAND_LABEL[brandOf(s)] || brandOf(s)) + '</span>' : '') + '</div><div class="id">' + esc(short) + '</div>' +
         (s.note ? '<div class="hint" style="font-size:11px;color:var(--ink-3);margin-top:2px" title="' + esc(s.note) + '">备注：' + esc(s.note) + '</div>' : '') + '</td>' +
       '<td>' + tag + note + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +

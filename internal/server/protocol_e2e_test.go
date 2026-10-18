@@ -3,6 +3,7 @@
 package server
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -96,6 +97,53 @@ func TestAnthropicMessagesE2EAuthError(t *testing.T) {
 	}
 	if !strings.Contains(got.Body.String(), "authentication_error") {
 		t.Errorf("error shape: %s", got.Body)
+	}
+}
+
+// TestAnthropicMessagesOversizedBodyDefaultAllowed /v1/messages 是 413 的真实踩点
+// （2026-10-18：nginx 日志里一串 POST /l3api/v1/messages 413，客户端每轮把历史图片
+// 以 base64 重发）。默认 unlimited 后 8MB+ 的 Anthropic 请求必须放行到上游。
+func TestAnthropicMessagesOversizedBodyDefaultAllowed(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up}) // MaxBodyBytes 未设 → 0 = 不限
+
+	// 8MB+ 的合法 Anthropic 请求体（padding 塞进 system 文本，JSON 保持合法）。
+	pad := strings.Repeat("x", 8<<20)
+	body := `{"model":"cn:glm-5.2","max_tokens":64,"system":"` + pad +
+		`","messages":[{"role":"user","content":"hi"}]}`
+	if len(body) <= 8<<20 {
+		t.Fatalf("fixture too small: %d", len(body))
+	}
+	got := httptest.NewRecorder()
+	h.ServeHTTP(got, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+	if got.Code != 200 {
+		t.Fatalf("code=%d want 200 (unlimited default); body=%s", got.Code, got.Body.String())
+	}
+}
+
+// TestAnthropicMessagesExplicitLimitStill413 显式设上限时 413 仍然生效（退出门）：
+// 不限是新默认，不是"取消这个功能"——填了正整数就得照旧拦。
+func TestAnthropicMessagesExplicitLimitStill413(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 512})
+
+	body := `{"model":"cn:glm-5.2","max_tokens":64,"system":"` +
+		strings.Repeat("x", 1024) + `","messages":[{"role":"user","content":"hi"}]}`
+	got := httptest.NewRecorder()
+	h.ServeHTTP(got, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+	if got.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code=%d want 413 (explicit 512B limit); body=%s", got.Code, got.Body.String())
+	}
+	// 413 必须是 Anthropic 错误形态；request_body_too_large 按设计映射成
+	// invalid_request_error（Anthropic 无 413 专用 error type），message 里保留原码。
+	out := got.Body.String()
+	if !strings.Contains(out, "invalid_request_error") {
+		t.Errorf("413 must use Anthropic error shape: %s", out)
+	}
+	if !strings.Contains(out, "server.max_body_mb") {
+		t.Errorf("413 message should name config key server.max_body_mb: %s", out)
 	}
 }
 

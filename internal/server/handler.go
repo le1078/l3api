@@ -129,17 +129,16 @@ type Handler struct {
 	// maxBodyBytes 请求体上限的运行期值（cfg.MaxBodyBytes 的原子镜像）。
 	// 面板在线改 server.max_body_mb 时经 SetMaxBodyBytes 热生效，无需重启
 	// （issue #17：改了配置却静默不生效，用户仍被 8MB 413 拦截）。
+	// <=0 = 不限（2026-10-18 起，与 config 同口径）。
 	maxBodyBytes atomic.Int64
 	// m 运行时指标集（cfg.MetricsEnabled=false 时 nil，/metrics 返回 404）。
 	m *metricsSet
 }
 
 // SetMaxBodyBytes 热更新请求体上限（面板保存配置路径调用）。
-// n<=0 与 NewHandler 兜底口径一致：回落 8MB。
+// n<=0 = 不限（与 config.Server.MaxBodyMB 同口径：0/缺省即不设限，2026-10-18 改）。
+// 旧口径把 <=0 兜底成 8MB，导致面板填 0 想表达"不限"却被当成 8MB 继续 413。
 func (h *Handler) SetMaxBodyBytes(n int64) {
-	if n <= 0 {
-		n = 8 << 20
-	}
 	h.maxBodyBytes.Store(n)
 }
 
@@ -157,9 +156,8 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
-	if cfg.MaxBodyBytes <= 0 {
-		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
-	}
+	// MaxBodyBytes <=0 保持原样（=不限，readChatBody 据此跳过 413 检查）。
+	// 旧口径在此兜底成 8MB，与 config 的"0 = 不限"冲突（2026-10-18 改）。
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.maxBodyBytes.Store(cfg.MaxBodyBytes)
 	if cfg.MetricsEnabled {

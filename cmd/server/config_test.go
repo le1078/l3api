@@ -568,14 +568,27 @@ func TestBalanceRefreshDefaults(t *testing.T) {
 	}
 }
 
-// TestMaxBodyDefault 默认 max_body_mb=8。
-func TestMaxBodyDefault(t *testing.T) {
+// TestMaxBodyDefaultUnlimited 默认 max_body_mb=0（=不限）。
+// 2026-10-18 改口径：旧默认是 8MB，多图/长上下文会话（历史图片每轮 base64 重发）
+// 实测轻松越过，网关前置的硬限只会把它们变成 413——"多大算过大"交给上游判定。
+func TestMaxBodyDefaultUnlimited(t *testing.T) {
 	c := Default()
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	if c.Server.MaxBodyMB != 8 {
-		t.Errorf("max_body_mb=%d want 8", c.Server.MaxBodyMB)
+	if c.Server.MaxBodyMB != 0 {
+		t.Errorf("max_body_mb=%d want 0（缺省=不限）", c.Server.MaxBodyMB)
+	}
+	// 键缺失与显式 0 同义：两者都必须通过 normalize 且都是"不限"。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"server":{}}`), 0o600)
+	c2, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.Server.MaxBodyMB != 0 {
+		t.Errorf("absent key: max_body_mb=%d want 0", c2.Server.MaxBodyMB)
 	}
 }
 
@@ -593,10 +606,24 @@ func TestMaxBodyExplicit(t *testing.T) {
 	}
 }
 
-// TestMaxBodyInvalid 非法值（0/负数）normalize 报错：0 想表达"不限"会被静默当成 8MB，
-// 与其误导不如 fail fast 提示显式配大上限。
+// TestMaxBodyZeroIsUnlimited 显式 0 合法且等于"不限"（不再报错）。
+// 旧口径把 0 判非法，用户想不限只能填一个拍脑袋的大数（2026-10-18 改）。
+func TestMaxBodyZeroIsUnlimited(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":0}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("max_body_mb=0 must be legal (unlimited): %v", err)
+	}
+	if c.Server.MaxBodyMB != 0 {
+		t.Errorf("max_body_mb=%d want 0", c.Server.MaxBodyMB)
+	}
+}
+
+// TestMaxBodyInvalid 负数仍非法（防 "-1" 被当成不限的误配）；超上界同样报错。
 func TestMaxBodyInvalid(t *testing.T) {
-	for _, v := range []string{"0", "-1"} {
+	for _, v := range []string{"-1", "-8", "1025"} {
 		dir := t.TempDir()
 		fp := filepath.Join(dir, "c.json")
 		os.WriteFile(fp, []byte(`{"server":{"max_body_mb":`+v+`}}`), 0o600)

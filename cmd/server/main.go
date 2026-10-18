@@ -35,7 +35,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.16.6-panel"
+const appVersion = "1.16.8-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -332,7 +332,8 @@ func main() {
 		PromptText:   cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled:  cfg.Global.Enabled,
-		MaxBodyBytes:   int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		// MB → 字节；0（缺省/不限）左移后仍是 0，handler 侧据此跳过 413 检查。
+		MaxBodyBytes:   int64(cfg.Server.MaxBodyMB) << 20,
 		MetricsEnabled: cfg.Metrics.Enabled,
 		Version:        appVersion,
 	})
@@ -503,6 +504,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// srv 为 nil 仅出现在装配未完成的窗口（SaveConfig 只在请求期被调，理论不可达），
 	// 跳过热应用即可——下次重启仍会从落盘的 config.json 读到新值。
 	if srv != nil {
+		// 0 直接透传（=不限）；热生效，与进程启动时同口径。
 		srv.SetMaxBodyBytes(int64(newCfg.Server.MaxBodyMB) << 20)
 	}
 

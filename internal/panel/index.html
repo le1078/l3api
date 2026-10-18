@@ -157,7 +157,9 @@ body {
 .topbar .sep { color: var(--ink-3); }
 .topbar .meta { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
 .topbar .grow { flex: 1; }
-.view { padding: 22px 24px 60px; max-width: 1180px; width: 100%; animation: viewIn .18s ease-out; }
+/* 内容区宽度：流式占满「窗口 - 侧栏」，只保留 1760px 上限防超宽屏单行过长。
+   旧值 1180px 在 2K/4K 屏把内容挤在左半边、右侧留一整片空白（2026-10-18 修）。 */
+.view { padding: 22px 24px 60px; max-width: 1760px; width: 100%; animation: viewIn .18s ease-out; }
 @keyframes viewIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
 .view[hidden] { display: none; }
 
@@ -261,13 +263,20 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 /* 模型表：紧凑一些，7 列在常见窗口下尽量免横向滚动 */
 .acc.md { min-width: 700px; }
 .acc.md th, .acc.md td { padding: 10px 9px; }
-.who { min-width: 118px; max-width: 200px; }
+/* 账号名列：宽度上限 + 昵称可截断。
+   旧写法把昵称文本与 .brand-tag 徽章混在同一个 nowrap 块里，文本一超宽就
+   整体省略——徽章被一起截掉（国际版那行显示「CodeBuddy 国…」）。改成
+   flex：昵称 .nmtxt 自己省略，徽章 flex:none 永远完整（2026-10-18 修）。 */
+.who { min-width: 118px; max-width: 220px; }
+.who .nm.nm-flex { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.who .nm .nmtxt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who .nm .brand-tag { flex: none; margin-left: 0; }
 #taskTable .who { max-width: 360px; }
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
 /* 模型与档位：模型列放宽（调用名/上游 ID 完整展示，长名折行不截断） */
 .acc.md .who { min-width: 220px; max-width: 420px; }
 .acc.md .who .nm, .acc.md .who .id { white-space: normal; word-break: break-all; overflow: visible; text-overflow: clip; }
-.who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who .nm { font-weight: 550; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
 /* brand-tag 品牌徽标（codebuddy 缺省不展示——它是本项目的原始品牌，零视觉噪音；
@@ -307,8 +316,10 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 /* ── 品牌卡片墙（账号池筛选，v1.12）──────────────────────────────────
    克制版（借鉴 shadcn/ui：中性底、极浅边框、层级靠阴影透明度而非彩色装饰）：
    装饰色只保留品牌徽标与选中态两处；hover 仅加深阴影，不平移不换色。 */
+/* auto-fit（不是 auto-fill）：auto-fill 会保留空 track，4 张卡在 1180 宽度下
+   排成 3+1 并把第 4 张压成半行；auto-fit 让现有卡片撑满整行。 */
 .brand-cards {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 14px; padding: 14px 16px; border-bottom: 1px solid var(--line-soft);
 }
 .bcard {
@@ -488,7 +499,10 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }
 .num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.usage-cell { min-width: 268px; }
+/* 用量列：宽度交给内容（width:1px 是表格里的「按内容收缩」惯用法）。
+   原来 min-width:268px 会把宽屏多出来的空间全吞进这一列，账号名列反而挤成
+   一行省略号（2026-10-18 修）。 */
+.usage-cell { min-width: 0; width: 1px; }
 .usage-line {
   display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
   font: 600 11.5px/1.25 var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap;
@@ -524,6 +538,21 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
 .acts { display: flex; gap: 5px; justify-content: flex-end; white-space: nowrap; }
 .acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
+/* 窄屏收紧：账号表 9 列在 ~1100px 内容宽下会溢出。按「窗口宽度」分两档降级：
+   先缩单元格内边距与昵称列上限，再缩操作按钮。宽屏观感不受影响。
+   （用量列已改为按内容收缩，不再需要在这里调 min-width。） */
+@media (max-width: 1500px) {
+  .acc th, .acc td { padding-left: 8px; padding-right: 8px; }
+  .who { max-width: 190px; }
+  .acts { gap: 4px; }
+}
+@media (max-width: 1320px) {
+  .acc th, .acc td { padding-left: 6px; padding-right: 6px; }
+  .who { max-width: 168px; }
+  .acts { gap: 3px; }
+  .acts button { padding: 3.5px 6px; }
+  .cred { min-width: 70px; }
+}
 
 .empty { padding: 40px 20px; text-align: center; color: var(--ink-3); }
 
@@ -1113,8 +1142,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="hr"></div>
             <div class="grid2">
               <label class="fld"><span class="lb">请求体上限（MB）</span>
-                <input name="max_body_mb" type="number" min="1" placeholder="8">
-                <span class="hint">多图会话可调大；保存后即时生效</span></label>
+                <input name="max_body_mb" type="number" min="0" max="1024" placeholder="留空或 0 = 不限">
+                <span class="hint">留空或 0 = 不限（默认）；多图/长上下文会话超 8MB 很常见；保存后即时生效</span></label>
               <label class="fld"><span class="lb">出站 User-Agent</span>
                 <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
                 <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
@@ -1397,6 +1426,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div id="toasts"></div>
 
 <script src="echarts.min.js"></script>
-<script src="app.js?v=1.16.6"></script>
+<script src="app.js?v=1.16.8"></script>
 </body>
 </html>

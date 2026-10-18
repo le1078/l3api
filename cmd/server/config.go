@@ -31,10 +31,15 @@ type Config struct {
 	APIKeys []apikeys.Entry `json:"api_keys,omitempty"`
 
 	Server struct {
-		// MaxBodyMB 聊天请求体大小上限（单位 MB，默认 8）。
+		// MaxBodyMB 聊天请求体大小上限（单位 MB）。
 		// 请求体超过该值直接返回 413 request_body_too_large，不再静默截断后喂给上游
 		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
-		// 0/负数视为非法 → normalize 回落默认并记录。
+		//
+		// 缺省/0 = 不限（2026-10-18 改口径）：多图会话与长上下文客户端每轮把历史
+		// 图片以 base64 重发，实测轻松越过原先的 8MB 默认（Anthropic /v1/messages
+		// 端点踩了一串 413）；网关本就该把"多大算过大"交给上游判定，本地硬限只是
+		// 把可用性问题前置成 413。要恢复限制显式填正整数（如 50）；上界 1024，
+		// 超出 normalize 报错。负值仍非法（防 "-1" 被当成不限的误配）。
 		MaxBodyMB int `json:"max_body_mb"`
 	} `json:"server"`
 
@@ -228,7 +233,9 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
-	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
+	// 请求体上限缺省 0 = 不限（2026-10-18 改口径，见 Server.MaxBodyMB 注释：
+	// 8MB 默认把多图/长上下文会话前置成 413，而"多大算过大"本该由上游判定）。
+	c.Server.MaxBodyMB = 0
 	c.Metrics.Enabled = true
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
@@ -434,10 +441,10 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
-	// max_body_mb 非法（0/负数）直接报错：0 若被静默当成默认 8MB，用户以为"不限"，
-	// 大请求又被静默 413——不如 fail fast 提示显式配大上限。
-	if c.Server.MaxBodyMB <= 0 {
-		return fmt.Errorf("server.max_body_mb: %d 非法（需为正整数，单位 MB）", c.Server.MaxBodyMB)
+	// max_body_mb：0（含缺省）= 不限；正值 = 上限（MB）；负值非法。
+	// 旧口径 0/负数一律报错，导致"想不限"只能填一个拍脑袋的大数（2026-10-18 改）。
+	if c.Server.MaxBodyMB < 0 {
+		return fmt.Errorf("server.max_body_mb: %d 非法（0 或留空 = 不限；要限制请填正整数，单位 MB，上限 1024）", c.Server.MaxBodyMB)
 	}
 	// 上界：int64(mb)<<20 在极端值下溢出 int64；1GB 上限对代理场景已绰绰有余。
 	if c.Server.MaxBodyMB > 1024 {
