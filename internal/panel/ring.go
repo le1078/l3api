@@ -36,15 +36,16 @@ type LogEntry struct {
 
 // ChatRow 一条对话表格日志的解析结果（对应 server.logging.logChatRow 的输出格式）。
 //
-// 格式：| #138 | 06:58:44 | cn:deepseek-v4.1-flash | stream | 200 | uid=55a0be20 |
-// TTFB=7989ms | tok=948 | 76.2tok/s | total=12.4s |
+// 格式：| #138 | 06:58:44 | CodeBuddy 国内版 | 55a0be20-44ce-4cab-b3dc-9e57d71bf238 |
+// cn:deepseek-v4.1-flash | stream | 200 | TTFB=7989ms | tok=948 | 76.2tok/s | total=12.4s |
 type ChatRow struct {
 	Seq     int     `json:"seq"`
 	At      string  `json:"at"`                // 行内本地时刻（HH:MM:SS），前端不单独展示（用 TS）
+	Brand   string  `json:"brand,omitempty"`   // 品牌展示名（含域，如「CodeBuddy 国内版」）
+	UID     string  `json:"uid"`               // 完整 uid（- = 未选到号）
 	Model   string  `json:"model"`             // 完整模型名（不截断）
 	Mode    string  `json:"mode"`              // stream | sync
 	Status  int     `json:"status"`            // HTTP 状态码
-	UID     string  `json:"uid"`               // 前 8 位
 	TTFBMs  int     `json:"ttfb_ms,omitempty"` // 0 = 未知
 	Tokens  int     `json:"tokens"`            // -1 = 上游没给 usage
 	TokPerS float64 `json:"tok_s"`             // 0 = 未知
@@ -53,8 +54,12 @@ type ChatRow struct {
 
 // chatRowRe 解析 chat 表格行。字段容忍缺失（老格式/异常行）——解析不出来
 // 就整体退回纯文本，不让日志查看功能因格式演进失效。
+//
+// 品牌名列允许含空格（「CodeBuddy 国内版」），故按最短匹配取到下一个 ` | ` 为止；
+// 紧随的 uid 段是UUID（无空格），再后面才是模型名——顺序固定，靠 uid 这一格
+// 把两个可含空格的字段（品牌、模型）隔开。
 var chatRowRe = regexp.MustCompile(
-	`^\| #(\d+) \| ([0-9:]+) \| (.+?) \| (\w+) \| (\d+) \| uid=(\S*) \| TTFB=(\S+) \| tok=(\S+) \| (\S+)tok/s \| total=([0-9.]+)s \|$`)
+	`^\| #(\d+) \| ([0-9:]+) \| (.+?) \| (\S*) \| (.+?) \| (\w+) \| (\d+) \| TTFB=(\S+) \| tok=(\S+) \| (\S+)tok/s \| total=([0-9.]+)s \|$`)
 
 // parseChatRow 解析一行 chat 表格日志；不匹配返回 nil。
 func parseChatRow(line string) *ChatRow {
@@ -65,25 +70,34 @@ func parseChatRow(line string) *ChatRow {
 	row := &ChatRow{
 		Seq:    atoiDefault(m[1], 0),
 		At:     m[2],
-		Model:  m[3],
-		Mode:   m[4],
-		Status: atoiDefault(m[5], 0),
-		UID:    m[6],
-		Tokens: atoiDefault(m[8], -1),
+		Brand:  dashToEmpty(m[3]),
+		UID:    dashToEmpty(m[4]),
+		Model:  m[5],
+		Mode:   m[6],
+		Status: atoiDefault(m[7], 0),
+		Tokens: atoiDefault(m[9], -1),
 	}
 	// TTFB=7989ms / TTFB=- ；tok=- 表示无 usage
-	if v := strings.TrimSuffix(m[7], "ms"); v != "-" {
+	if v := strings.TrimSuffix(m[8], "ms"); v != "-" {
 		row.TTFBMs = atoiDefault(v, 0)
 	}
-	if v := strings.TrimSuffix(m[9], ""); v != "-" {
+	if v := strings.TrimSuffix(m[10], ""); v != "-" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			row.TokPerS = f
 		}
 	}
-	if f, err := strconv.ParseFloat(m[10], 64); err == nil {
+	if f, err := strconv.ParseFloat(m[11], 64); err == nil {
 		row.TotalMs = int(f * 1000)
 	}
 	return row
+}
+
+// dashToEmpty 把日志里的占位符 "-" 还原成空串（前端据此不渲染该字段）。
+func dashToEmpty(s string) string {
+	if s == "-" {
+		return ""
+	}
+	return s
 }
 
 // atoiDefault 解析失败或空串时返回 def。

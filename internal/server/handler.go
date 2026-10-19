@@ -1059,6 +1059,9 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 			break
 		}
 		st.uid = acct.UID
+		// 品牌展示名（含域）随账号一起定下来：日志行要在模型前面打出「谁打的」；
+		// 换号重试时跟着本轮的 acct 走，不留上一轮的品牌。
+		st.brand = brandLabel(acct.Brand(), acct.Realm())
 		tried[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
@@ -1094,7 +1097,7 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 					// 竞态临时触发，一次失败就永久杀号是历史 P0-1 误杀的根因
 					// （2026-10-13 与 keepalive/chat 路径统一口径）。
 					if h.cfg.Pool.NoteSessionDead(acct.UID) {
-						log.Printf("chat refresh uid=%s: session dead 连续 %d 次，已禁用", uidPrefix(acct.UID), pool.SessionDeadThreshold())
+						log.Printf("chat refresh uid=%s: session dead 连续 %d 次，已禁用", uidFull(acct.UID), pool.SessionDeadThreshold())
 					}
 				} else {
 					// refresh 端点失败 ≠ chat 通道故障：只给短软冷却，不喂 chat
@@ -1576,7 +1579,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 阈值化：一次 12153 只记数+亮徽章，连续 sessionDeadThreshold 次才禁用
 		// （与 keepalive 路径同口径；见 pool.NoteSessionDead 注释的误杀史）。
 		if h.cfg.Pool.NoteSessionDead(uid) {
-			log.Printf("WARN: [server] uid=%s 连续 session dead 达阈值，已禁用", uidPrefix(uid))
+			log.Printf("WARN: [server] uid=%s 连续 session dead 达阈值，已禁用", uidFull(uid))
 		}
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：

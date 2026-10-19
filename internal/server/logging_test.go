@@ -137,39 +137,71 @@ func TestCompletionTokensExtraction(t *testing.T) {
 	}
 }
 
-func TestUIDPrefix(t *testing.T) {
-	if got := uidPrefix("00e26541abcdef012345"); got != "00e26541" {
-		t.Errorf("long uid -> %q", got)
+func TestUIDFull(t *testing.T) {
+	if got := uidFull("00e26541abcdef012345"); got != "00e26541abcdef012345" {
+		t.Errorf("uid must not be truncated -> %q", got)
 	}
-	if got := uidPrefix("abc"); got != "abc" {
-		t.Errorf("short uid -> %q", got)
-	}
-	if got := uidPrefix(""); got != "-" {
+	if got := uidFull(""); got != "-" {
 		t.Errorf("empty uid -> %q", got)
+	}
+}
+
+// TestBrandLabel 品牌展示名：codebuddy 按 realm 分国内/国际版，qoder/trae 各自一档，
+// 空品牌回落 codebuddy（老凭证缺省，同 auth.Brand() 口径）。
+func TestBrandLabel(t *testing.T) {
+	cases := []struct{ brand, realm, want string }{
+		{"codebuddy", "cn", "CodeBuddy 国内版"},
+		{"codebuddy", "global", "CodeBuddy 国际版"},
+		{"", "global", "CodeBuddy 国际版"},     // 老凭证空 brand 回落 codebuddy
+		{"", "cn", "CodeBuddy 国内版"},         // 同上（工具/app.js$ 旧 Render 路径）
+		{"CODEBUDDY", "cn", "CodeBuddy 国内版"}, // 大小写容错（auth 文件可能大写）
+		{"qoder", "cn", "Qoder"},
+		{"trae", "cn", "Trae"},
+		{"coze", "cn", "coze"}, // 未知值原样透出（脏数据可见，不静默伪装）
+	}
+	for _, c := range cases {
+		if got := brandLabel(c.brand, c.realm); got != c.want {
+			t.Errorf("brandLabel(%q,%q) = %q want %q", c.brand, c.realm, got, c.want)
+		}
 	}
 }
 
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234)
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream",
+			"00e26541-44ce-4cab-b3dc-9e57d71bf238", http.StatusOK, 1234, "CodeBuddy 国内版")
 	})
 	for _, want := range []string{
-		"| #", "deepseek-v4", "| stream |", "| 200 |", "uid=00e26541", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
+		"| #", "CodeBuddy 国内版", "00e26541-44ce-4cab-b3dc-9e57d71bf238",
+		"deepseek-v4", "| stream |", "| 200 |", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "00e26541abcdef") {
-		t.Errorf("full uid leaked: %s", out)
+	// 品牌与 uid 必须排在模型前面：日志的第一归因对象是「哪个账号打的」。
+	if strings.Index(out, "CodeBuddy 国内版") > strings.Index(out, "deepseek-v4") {
+		t.Errorf("brand must precede model:\n%s", out)
+	}
+}
+
+// TestLogChatRowUnknownAccount 未选到号（换号重试全失败 / 鉴权前置失败）时
+// 品牌与 uid 都显示 "-"，不打空列让人误以为漏了字段。
+func TestLogChatRowUnknownAccount(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRow(0, time.Second, "glm-5.2", "sync", "", http.StatusServiceUnavailable, -1, "")
+	})
+	if !strings.Contains(out, "| - | - |") {
+		t.Errorf("missing account placeholders:\n%s", out)
 	}
 }
 
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, "Qoder")
 	})
 	for _, want := range []string{"TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
 		if !strings.Contains(out, want) {
@@ -181,8 +213,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, "Trae")
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, "Trae")
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -215,7 +247,7 @@ func TestChatLogsStreamRow(t *testing.T) {
 			t.Fatalf("code=%d", rec.Code)
 		}
 	})
-	for _, want := range []string{"| stream |", "| 200 |", "uid=u1", "TTFB=", "tok=1"} {
+	for _, want := range []string{"| stream |", "| 200 |", "u1", "CodeBuddy 国内版", "TTFB=", "tok=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stream row missing %q:\n%s", want, out)
 		}
@@ -264,7 +296,7 @@ func TestChatLogsErrorRow(t *testing.T) {
 			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 		}
 	})
-	for _, want := range []string{"uid=u1", "| 503 |", "tok=-"} {
+	for _, want := range []string{"u1", "CodeBuddy 国内版", "| 503 |", "tok=-"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("error row missing %q:\n%s", want, out)
 		}

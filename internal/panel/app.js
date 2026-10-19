@@ -1046,10 +1046,20 @@ async function loadLogs() {
   } catch (e) { /* 概览已提示 */ }
 }
 
+/* whoKey 把后端打的品牌展示名映射回 CSS 配色键（codebuddy / codebuddy-global /
+   qoder / trae），复用 .brand-badge 的品牌色。命中不了就用默认（accent 靛蓝）。 */
+function whoKey(brand) {
+  const s = String(brand || '').toLowerCase();
+  if (s.includes('qoder')) return 'qoder';
+  if (s.includes('trae')) return 'trae';
+  if (s.includes('国际')) return 'codebuddy-global';
+  return 'codebuddy';
+}
+
 /* logEntryHTML 渲染一条日志（都是**单行**，v1.16.15 起）。
-   - 对话行（后端已解析成 row）：时间 · 完整模型名 · 状态 · 指标，一行铺开；
-     不用两行卡片——一屏 4~5 条的密度看日志得翻很久。行内那个与 TS 重复的
-     时刻**不再展示**（「每行两个时间」困惑的根因）。
+   - 对话行（后端已解析成 row）：时间 · 品牌+账号 · 完整模型名 · 状态 · 指标，
+     一行铺开；不用两行卡片——一屏 4~5 条的密度看日志得翻很久。行内那个与 TS
+     重复的时刻**不再展示**（「每行两个时间」困惑的根因）。
    - 任务/系统行：等宽文本，保留终端质感与级别着色。
    - row 缺失（老格式/解析失败）：退回原始文本，信息不丢。 */
 function logEntryHTML(e) {
@@ -1080,8 +1090,20 @@ function logEntryHTML(e) {
       metrics += '<span class="kv mute">无 usage</span>';
     }
     metrics += kv('耗时 ', (r.total_ms / 1000).toFixed(1) + 's', slow ? 'warn' : '');
+    /* 品牌 + 账号（v1.17.2）：排在模型前面——「这条请求谁打的」才是慢/失败/
+       扣费归因的第一个对象，模型在这条日志里是次一级信息。品牌用既有品牌配色
+       的小胶囊（与账号页 .brand-badge 同色系），uid 用暗灰等宽小字。 */
+    let who = '';
+    if (r.brand || r.uid) {
+      const key = whoKey(r.brand);
+      who = '<span class="who"' + (r.uid ? ' title="uid: ' + esc(r.uid) + '"' : '') + '>' +
+        (r.brand ? '<i class="wb ' + key + '">' + esc(r.brand) + '</i>' : '') +
+        (r.uid ? '<i class="uid">' + esc(r.uid) + '</i>' : '') +
+        '</span>';
+    }
     return '<span class="lg-chat' + cls + '">' + chBadge +
       '<span class="ts">' + esc(t) + '</span>' +
+      who +
       '<span class="mdl" title="' + esc(r.model) + '">' + esc(r.model) + '</span>' +
       '<span class="bd">' + metrics + '</span>' +
       '<span class="seq">#' + r.seq + '</span>' +

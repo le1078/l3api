@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/l3api/internal/pool"
+	"github.com/linguo2625469/l3api/internal/provider"
 	"github.com/linguo2625469/l3api/internal/upstream"
 )
 
@@ -36,6 +37,7 @@ type chatStat struct {
 	model  string
 	mode   string // "stream" | "sync"
 	uid    string // 完整 uid，展示时只取前 8 位
+	brand  string // 上游品牌 + 域的展示名（"CodeBuddy 国内版"），空 = 未选到号
 	ttfb   time.Duration
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
@@ -63,7 +65,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.brand)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -290,13 +292,42 @@ func completionTokens(resp map[string]any) int {
 	return int(v)
 }
 
-// uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。
-func uidPrefix(uid string) string {
+// brandLabel 返回账号归属的展示名（品牌 + 域），供对话日志行显示：
+// codebuddy 分「国内版 / 国际版」（差在 realm：模型前缀 cn/global 走的其实是
+// 两套完全不同的账号与配额），qoder / trae 各自一档。空串（未选到号）返回 "-"。
+//
+// 为什么不复用 provider.DisplayName()：那个面向「添加账号」的品牌选择项
+//（"CodeBuddy (WorkBuddy)"、"Qoder (阿里)"），带公司归属；日志行每行都打，
+// 要的是能对齐的短标签，且与前端 BRAND_LABEL 的口径一致（那里也是
+// codebuddy / codebuddy-global / qoder / trae 四档）。
+func brandLabel(brand, realm string) string {
+	b := strings.ToLower(strings.TrimSpace(brand))
+	if b == "" {
+		b = string(provider.CodeBuddy) // 老凭证缺省，同 auth.Brand() 口径
+	}
+	switch provider.Brand(b) {
+	case provider.Qoder:
+		return "Qoder"
+	case provider.Trae:
+		return "Trae"
+	case provider.CodeBuddy:
+		if realm == "global" {
+			return "CodeBuddy 国际版"
+		}
+		return "CodeBuddy 国内版"
+	default:
+		// 未知值原样透出（同 auth.Brand() 的脏数据可见策略）
+		return brand
+	}
+}
+
+// uidFull 展示完整 uid；空 uid 显示 "-"。
+// 为什么不截前 8 位：日志是给人定位具体账号用的（对着面板「账号」页 Ctrl+F
+// 找这个 uid），截断后多个同前缀号会撞车；行虽变长，但这是排障现场唯一能
+// 直接复制去搜的东西。
+func uidFull(uid string) string {
 	if uid == "" {
 		return "-"
-	}
-	if len(uid) > 8 {
-		return uid[:8]
 	}
 	return uid
 }
@@ -307,7 +338,11 @@ func uidPrefix(uid string) string {
 // 模型名**不截断**（v1.16.13）：此前截到 11 个字符，`cn:deepseek-v4.1-flash`
 // 只剩 `cn:deepseek`，面板里根本分不清调的是哪个模型。完整名交给面板按列宽
 // 换行/省略；终端表格宽度由使用者自己调（日志是给人排障看的，宁可宽一点）。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
+//
+// 品牌 + uid 前置到模型前面（v1.17.2）：一行日志要先能回答「哪个账号打的上游」，
+// 再回答「用的什么模型」——前者才是「为什么这条慢 / 为什么这条收费」的第一归因
+// 对象。之前只有 uid= 前 8 位挤在状态后面，既截断又排在了次要位置。
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int, brand string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -326,13 +361,17 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	if brand == "" {
+		brand = "-"
+	}
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %s | %s | %d | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
+		brand,
+		uidFull(uid),
 		model,
 		mode,
 		status,
-		uidPrefix(uid),
 		ttfbMS,
 		tokField,
 		tokpsField,
