@@ -157,11 +157,14 @@ respond /l3api/metrics 403
 `auths/`（7 个账号登录态，trae 的 accessToken 8h 有效且**无 refresh_token**，
 丢一次 = 全部人工重新抓登录）、`data/state.json`（冷却/禁用/成本台账）、
 `config.json`（api_key + 腾讯文档 token）**没有自动备份就等于没有备份**。
-仓库内 `scripts/` 提供两个运维脚本（已装到云机 `/root/l3api-ops/` 并注册 cron）：
+仓库内 `scripts/` 提供三个运维脚本（已装到云机 `/root/l3api-ops/` 并注册 cron）：
 
 ```bash
-# 每日加密备份（gpg AES256 对称加密；口令文件 0600；保留最近 7 份）
+# 每日加密备份（gpg AES256 对称加密；保留最近 7 份）
 30 3 * * * /root/l3api-ops/l3api-backup.sh >> /var/log/l3api-backup.log 2>&1
+
+# 备份口令多副本守护（主副本缺失时从副副本自动恢复）——跑在备份之后
+40 3 * * * /root/l3api-ops/l3api-passkeeper.sh >> /var/log/l3api-passkeeper.log 2>&1
 
 # 容器健康 + 磁盘/内存水位 + state.json 落盘失败巡检（异常退出码 1）
 */15 * * * * /root/l3api-ops/l3api-healthcheck.sh >> /var/log/l3api-healthcheck.log 2>&1
@@ -169,14 +172,30 @@ respond /l3api/metrics 403
 
 备份口径：`tar` 只打 `auths/ data/ config.json`（源码在 git 仓库，不进备份），
 gpg 加密后落 `/root/l3api-backups/l3api-<ts>.tar.gpg`。
-**口令文件 `/root/.l3api-backup-passphrase` 丢失 = 备份不可用**——首次运行时会
-打印提醒，请立即存进密码管理器。
 
 恢复：
 
 ```bash
 gpg --passphrase-file /root/.l3api-backup-passphrase -d l3api-<ts>.tar.gpg | tar xv -C <运行目录>
 ```
+
+### 口令的三副本与「不开新链」语义（v1.17 修正）
+
+口令文件本身是单点——它丢了，所有加密备份立刻不可解密。`l3api-passkeeper.sh`
+把它复制到三个「不同死法」的位置（均 root 0600）：
+
+| 副本 | 路径 | 作用 |
+|------|------|------|
+| 主 | `/root/.l3api-backup-passphrase` | 备份脚本直接用 |
+| 副1 | `/root/.l3api-secrets/passphrase.bak` | 恢复源 |
+| 副2 | `/etc/l3api-backup-passphrase` | 恢复源（异目录，异故障域） |
+
+- 主副本在 → 每日同步覆盖两个副副本（副副本**只作恢复源**，绝不反向生成口令）。
+- 主副本被误删 → 从副副本自动恢复（日志 `RECOVER`，md5 比对防污染）。
+- 副副本内容互相不一致 → **不猜**，只报警（日志 `ALERT`），人工裁定。
+- 三副本全丢 → 备份脚本**拒绝运行**（退出码 2），不会静默生成新口令把旧备份
+  变成不可解密——要重开备份链必须显式 `L3API_BACKUP_INIT=1 l3api-backup.sh`，
+  此时旧备份会被移到 `orphaned-<ts>/`（**不删**，旧口令找回时仍可解密）。
 
 健康巡检覆盖应用内 notify 到不了的盲区：容器存活 / healthcheck 状态 /
 **重启计数变化**（上次巡检值在 `/tmp/l3api-restart-count`）/ 磁盘水位（≥85%）/
