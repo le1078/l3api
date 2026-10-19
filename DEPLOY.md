@@ -127,20 +127,61 @@ curl 127.0.0.1:9090/api/v1/targets | grep -o l3api   # 验证抓取 UP
 ```
 
 指标面：`l3api_chat_requests_total{model,realm,status,mode}`、
-`l3api_chat_attempts_total{realm,outcome}`、`l3api_chat_request_duration_seconds`、
-`l3api_pool_accounts{brand,state}`、`l3api_pool_in_flight`、`l3api_sticky_sessions`。
+`l3api_chat_attempts_total{realm,outcome}`、
+`l3api_chat_upstream_errors_total{kind,status}`（v1.17 新增：429/5xx/超时/内容拦截分维）、
+`l3api_chat_pick_failures_total{realm,reason}`（v1.17 新增：选号失败归因——
+reason ∈ cooling/breaker/degrade/in_flight_full/free_exhaust/model_cooldown/credit_floor/realm_mismatch）、
+`l3api_chat_request_duration_seconds`、`l3api_pool_accounts{brand,state}`、
+`l3api_pool_in_flight`、`l3api_sticky_sessions`、`l3api_goroutines`。
 数据保留 15 天（约 200~400MB），落在 `data/prometheus/`。
 
 **安全边界（必读）**：`/metrics` 无鉴权，公网反代必须拦截——
+若反代把 l3api 挂在**子路径**下（如 `/l3api/`），拦截规则要用**精确匹配**
+（优先级高于前缀匹配，且子路径前缀形态同样要拦）：
 
 ```nginx
-# Nginx 在 location / 之前加：
-location = /metrics { return 403; }
+# Nginx：精确匹配优先级高于 ^~ /l3api/，放在它前面即可
+location = /l3api/metrics { return 403; }
 ```
 ```
 # Caddy 在站点块内加：
-respond /metrics 403
+respond /l3api/metrics 403
 ```
+
+2026-10-20 实测：子路径部署（`location ^~ /l3api/` 整块反代）时只写了
+`location = /metrics`（裸路径口径）是**拦不住的**——`/l3api/metrics`
+照样 200 全量暴露（模型名/成功率/池规模/账号维度）。
+
+## 备份与恢复（v1.17）
+
+`auths/`（7 个账号登录态，trae 的 accessToken 8h 有效且**无 refresh_token**，
+丢一次 = 全部人工重新抓登录）、`data/state.json`（冷却/禁用/成本台账）、
+`config.json`（api_key + 腾讯文档 token）**没有自动备份就等于没有备份**。
+仓库内 `scripts/` 提供两个运维脚本（已装到云机 `/root/l3api-ops/` 并注册 cron）：
+
+```bash
+# 每日加密备份（gpg AES256 对称加密；口令文件 0600；保留最近 7 份）
+30 3 * * * /root/l3api-ops/l3api-backup.sh >> /var/log/l3api-backup.log 2>&1
+
+# 容器健康 + 磁盘/内存水位 + state.json 落盘失败巡检（异常退出码 1）
+*/15 * * * * /root/l3api-ops/l3api-healthcheck.sh >> /var/log/l3api-healthcheck.log 2>&1
+```
+
+备份口径：`tar` 只打 `auths/ data/ config.json`（源码在 git 仓库，不进备份），
+gpg 加密后落 `/root/l3api-backups/l3api-<ts>.tar.gpg`。
+**口令文件 `/root/.l3api-backup-passphrase` 丢失 = 备份不可用**——首次运行时会
+打印提醒，请立即存进密码管理器。
+
+恢复：
+
+```bash
+gpg --passphrase-file /root/.l3api-backup-passphrase -d l3api-<ts>.tar.gpg | tar xv -C <运行目录>
+```
+
+健康巡检覆盖应用内 notify 到不了的盲区：容器存活 / healthcheck 状态 /
+**重启计数变化**（上次巡检值在 `/tmp/l3api-restart-count`）/ 磁盘水位（≥85%）/
+可用内存（<300MB）/ `state.json` 连续落盘失败（面板 overview 的
+`state_persist_fails`，需 `L3API_API_KEY` 环境变量才查）。
 
 ## 关键提醒
 
@@ -151,5 +192,17 @@ respond /metrics 403
   瞬间的写原子性）。要完整原子性可改为挂载目录（`./config:/app/config` 并把
   `config_path` 指向 `/app/config/config.json`）。
 - **TZ=Asia/Shanghai 已在 compose 里设好**，影响签到/冷却重置时刻，勿删。
-- 备份：定期打包 `auths/` + `data/` 异地存放（含明文 token，注意加密）。
+  另：v1.17 起 main 内嵌 `time/tzdata`（+450KB），促销时段按上游
+  `schedule.timezone` 解析时区不再依赖镜像里的 `/usr/share/zoneinfo`。
+- 备份：见上一节（`scripts/l3api-backup.sh`，加密 + cron 已就位）。
 - 面板仅回环可达；公网访问面板走反代后可加 IP 白名单/Basic Auth 再加一层。
+
+## v1.17 新增配置项
+
+| 键 | 缺省 | 说明 |
+|----|------|------|
+| `upstream.stream_total_timeout_seconds` | 1800 | 聊天 SSE 流总时长硬顶。与 `idle_timeout_seconds`（管静默多久）分工：本项管总共多久——上游 keepalive 拖流时 idle 永不触发，流会无限期占用账号在途名额（`max_in_flight=8`，几条这样的流就把池子打满）。显式 `0` = 禁用硬顶；负数归一为禁用。 |
+| `upstream.header_timeout_seconds` | 60 | 首字节前（响应头）超时。**v1.17 改为独立兜底 60s**（原回落 `timeout_seconds=120`，比 transport 选的 60s 慢一倍，MaxRotate=3 最坏轮转从 3min 变 6min）。 |
+
+环境变量：`WB2A_STREAM_TOTAL_TIMEOUT_SECONDS`（对应 `stream_total_timeout_seconds`）。
+

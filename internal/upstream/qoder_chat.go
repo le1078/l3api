@@ -221,23 +221,21 @@ func (c *Client) QoderChatStream(ctx context.Context, a *auth.Auth, body []byte,
 		ctx = context.Background()
 	}
 	// jobToken 滚动刷新（AccessToken 即当前 jobToken；NeedsRefresh 判过期窗口）。
+	// 单飞（2026-10-20）：同账号并发请求（max_in_flight=8）同时进过期窗口时
+	// 只有 leader 真打 refresh 端点——否则 8 次滚动刷新互相覆盖 auth 字段，
+	// 且风控视角是同 uid 短时多次刷 token。四条 qoder 路径共用同一单飞组
+	//（qoderRefreshSingleflight）：chat/modelsync/checkin/RefreshIfNeeded。
 	if a.NeedsRefresh(qoderRefreshSkew) {
 		if a.RefreshToken == "" {
 			return nil, 0, nil, &Error{Kind: ErrSessionDead, Status: 401,
 				Msg: "qoder refresh_token missing"}
 		}
-		sess, err := c.qoderRefreshJobToken(ctx, a.RefreshToken)
-		if err != nil {
-			return nil, 0, nil, err
-		}
-		a.Lock()
-		a.AccessToken = sess.JobToken
-		a.RefreshToken = sess.RefreshToken
-		a.ExpiresAt = sess.ExpiresAt.Unix()
-		a.Unlock()
-		if err := a.SaveAtomic(); err != nil {
-			// 落盘失败不阻断本次请求（下次启动会冷交换），静默容错。
-			_ = err
+		_ = c.qoderRefreshSingleflight(a)
+		// 单飞完成仍临期 = 刷新失败（保持旧 token）：按 session dead 换号
+		// （与旧实现的错误分类一致：调用方走 ErrSessionDead 阈值化禁用）。
+		if a.NeedsRefresh(qoderRefreshSkew) {
+			return nil, 0, nil, &Error{Kind: ErrSessionDead, Status: 401,
+				Msg: "qoder token refresh failed"}
 		}
 	}
 	if a.UID == "" || a.AccessToken == "" {
@@ -295,7 +293,7 @@ func (c *Client) QoderChatStream(ctx context.Context, a *auth.Auth, body []byte,
 
 	// 4) 成功流：包一层信封解包器，把 data:{"body":"..."} 还原成 data:{...}。
 	rc := &qoderSSEUnwrapper{
-		rc:     monitorBody(resp.Body, c.IdleTimeout, cancel),
+		rc:     monitorBody(resp.Body, c.IdleTimeout, c.StreamTotalTimeout, cancel),
 		cancel: cancel,
 	}
 	return rc, resp.StatusCode, nil, nil
@@ -492,6 +490,11 @@ func (u *qoderSSEUnwrapper) fill() error {
 	var frame strings.Builder
 	for {
 		line, err := u.br.ReadString('\n')
+		// 单行上界（2026-10-20）：qoder 信封帧含 base64 body，但无换行超长行
+		// 只可能是上游故障——超限断流（调用方走既有解析失败路径）。
+		if lerr := CheckSSELineLen(line, 0); lerr != nil {
+			return lerr
+		}
 		if err != nil {
 			if err == io.EOF && frame.Len() > 0 {
 				// 尾帧无换行：处理已累积的帧（不清 frame，下方照常 emit）。

@@ -121,6 +121,16 @@ type Config struct {
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+		// StreamTotalTimeoutSeconds 聊天 SSE 流总时长硬顶（2026-10-20）。
+		// 缺省（未设置）→ 1800（30min）；显式 0 = 禁用硬顶；负数归一为禁用。
+		// 区分「未设置」与「显式 0」靠 streamTotalRaw（指针，json 忽略）：
+		// 缺省时指针为 nil，显式 0 时非 nil 且值为 0——否则「禁用」会被
+		// 缺省补齐逻辑补成 1800。
+		// 与 idle 的分工：idle 管静默多久，本项管总共多久——上游每 N 分钟吐
+		// 1 字节 keepalive 时 idle 永不触发，流会无限期占用账号在途名额
+		// （几条这样的流就把池子打满、正常请求全 503）。到点强制断流。
+		StreamTotalTimeoutSeconds int  `json:"stream_total_timeout_seconds"`
+		streamTotalRaw            *int `json:"-"`
 		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
@@ -320,6 +330,16 @@ func ParseConfigInto(raw []byte, c *Config) (*Config, error) {
 	if err := json.Unmarshal(raw, c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	// stream_total_timeout_seconds 的「未设置 vs 显式 0」需要原始 JSON 判定
+	// （2026-10-20）：普通 int 字段两者都是 0，会把「显式禁用硬顶」补成 1800。
+	var rawUp struct {
+		Upstream struct {
+			StreamTotalTimeoutSeconds *int `json:"stream_total_timeout_seconds"`
+		} `json:"upstream"`
+	}
+	if json.Unmarshal(raw, &rawUp) == nil {
+		c.Upstream.streamTotalRaw = rawUp.Upstream.StreamTotalTimeoutSeconds
+	}
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
@@ -402,6 +422,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_IDLE_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Upstream.IdleTimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_STREAM_TOTAL_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.StreamTotalTimeoutSeconds = n
 		}
 	}
 	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
@@ -514,13 +539,27 @@ func (c *Config) normalize() error {
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
-	// header 缺省回落 timeout（保"首字节前换号"既有语义）；idle 缺省走内置大值。
-	// 任务书约定：0 一律视为"未设置"走默认，真正的"禁用"留待后续（避免歧义）。
+	// header 缺省独立回落 60s（2026-10-20 修正：原回落 timeout_seconds=120s，
+	// 比 transport.go 精心选的 60s 慢一倍——MaxRotate=3 的最坏轮转从 3min
+	// 变 6min，且 transport.go:36 注释明确反对放大首字节超时）。
+	// idle/stream_total 缺省走内置大值。任务书约定：0 一律视为"未设置"走默认，
+	// 真正的"禁用"留待后续（避免歧义）。
 	if c.Upstream.HeaderTimeoutSeconds <= 0 {
-		c.Upstream.HeaderTimeoutSeconds = c.Upstream.TimeoutSeconds
+		c.Upstream.HeaderTimeoutSeconds = 60
 	}
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
+	}
+	// 流总时长硬顶（2026-10-20）：缺省 1800s（30min）。合法长回答远小于此
+	// （keepalive 拖流才是本项要防的）。三分支口径见字段注释：未设置→1800、
+	// 负数→0（禁用）、显式值（含 0=禁用）原样。
+	switch {
+	case c.Upstream.streamTotalRaw == nil:
+		c.Upstream.StreamTotalTimeoutSeconds = 1800
+	case *c.Upstream.streamTotalRaw < 0:
+		c.Upstream.StreamTotalTimeoutSeconds = 0
+	default:
+		c.Upstream.StreamTotalTimeoutSeconds = *c.Upstream.streamTotalRaw
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen

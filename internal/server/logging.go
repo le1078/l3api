@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/l3api/internal/pool"
+	"github.com/linguo2625469/l3api/internal/upstream"
 )
 
 // chatSeq 进程级请求序号。
@@ -43,12 +44,17 @@ type chatStat struct {
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
-func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
+// logModel 由调用方从 bodyFacts 单次解析产出（2026-10-20 合并：原先此处独自
+// parseModelFromBody 解析 body，与调用方 peek 完全重复）。空串按 "-" 兜底。
+func newChatStat(now time.Time, logModel string, stream bool) *chatStat {
 	mode := "sync"
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+	if logModel == "" {
+		logModel = "-"
+	}
+	return &chatStat{start: now, model: logModel, mode: mode, toks: -1}
 }
 
 // done 幂等落一行表格日志。
@@ -78,6 +84,9 @@ type chatStatsReader struct {
 	hasCredit bool
 	credit    float64
 	pend      []byte // 已读未返回的行缓存
+	// lineBuf pend 的复用缓冲（2026-10-20：原先每行 []byte(line) 新分配一次，
+	// 500 帧流 = 500 alloc）。SSE 行长稳定 → 第二次起零分配。
+	lineBuf []byte
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -110,6 +119,11 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
+//
+// 性能（2026-10-20）：预过滤 strings.Contains(payload, "usage") 置于解析之前。
+// 上游 usage 只出现在末帧（带 usage 的帧占比 ~0.2%），过滤前每帧都要全量
+// json.Unmarshal 一遍 5KB 的 delta 帧；过滤后约 100% 帧零 JSON 开销。
+// TTFB 判定保持在过滤之前——首帧无论是否带 usage 都要计时。
 func (s *chatStatsReader) parseSSELine(line string) {
 	line = strings.TrimRight(line, "\r\n")
 	if !strings.HasPrefix(line, "data: ") {
@@ -122,6 +136,9 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if !s.seen {
 		s.seen = true
 		s.ttfb = time.Since(s.start)
+	}
+	if !strings.Contains(payload, "usage") {
+		return // 无 usage 字段的帧（绝大多数）：不付 JSON 解析开销
 	}
 	var chunk struct {
 		Usage *struct {
@@ -153,6 +170,10 @@ func (s *chatStatsReader) parseSSELine(line string) {
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
+//
+// 性能（2026-10-20）：pend 复用固定 buffer（原先每行 []byte(line) 新分配一次，
+// 500 帧流 = 500 次 alloc）。lineBuf 容量按行长增长后保留——SSE 行长通常
+// 稳定在几 KB，第二次起零分配。
 func (s *chatStatsReader) Read(p []byte) (int, error) {
 	if len(s.pend) > 0 {
 		n := copy(p, s.pend)
@@ -160,9 +181,19 @@ func (s *chatStatsReader) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	line, err := s.br.ReadString('\n')
+	// 单行上界（2026-10-20）：与 upstream 读循环同口径——故障上游的无换行
+	// 超长行会让 ReadString 无界扩容，统计 reader 也必须断流（错误经
+	// WriteStream 返回给 handler 走 502）。
+	if lerr := upstream.CheckSSELineLen(line, 0); lerr != nil {
+		return 0, lerr
+	}
 	if line != "" {
 		s.parseSSELine(line)
-		s.pend = []byte(line)
+		// 复用 lineBuf：只在容量不足时增长（行长短稳定 → 第二次起零 alloc）。
+		if cap(s.lineBuf) < len(line) {
+			s.lineBuf = make([]byte, len(line))
+		}
+		s.pend = append(s.lineBuf[:0], line...)
 		n := copy(p, s.pend)
 		s.pend = s.pend[n:]
 		return n, nil
@@ -192,6 +223,10 @@ func rewriteModel(body []byte, bare string) []byte {
 }
 
 // parseModelFromBody 从请求 JSON 取 model 字段，缺省标 "-"。
+//
+// 注意：chat 热路径已不再使用本函数（2026-10-20 起 model 由 bodyFacts 单次解析
+// 产出，消除与调用方 peek 的重复解析）。保留供测试与非 chat 路径（如诊断）
+// 单独查询模型名使用。
 func parseModelFromBody(body []byte) string {
 	var obj struct {
 		Model string `json:"model"`

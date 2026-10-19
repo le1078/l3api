@@ -28,6 +28,9 @@ type anthropicStreamWriter struct {
 	flusher  http.Flusher
 	reqModel string
 
+	// buf 帧组装复用缓冲（2026-10-20：消掉每帧 3 次分配）。
+	buf []byte
+
 	msgID         string
 	model         string
 	started       bool
@@ -92,16 +95,22 @@ func WriteAnthropicStream(w http.ResponseWriter, r io.Reader, reqModel string) e
 }
 
 // writeEvent 写一帧 Anthropic SSE（event: <type> + data: payload）。
+//
+// 性能（2026-10-20）：帧组装走复用缓冲 sw.buf（append 三段后单次 Write），
+// 消掉原先 string(raw) 拷贝 + 两处字符串拼接的 3 次分配/帧。
 func (sw *anthropicStreamWriter) writeEvent(eventType string, obj map[string]any) bool {
 	obj["type"] = eventType
 	raw, err := json.Marshal(obj)
 	if err != nil {
 		return false
 	}
-	if _, werr := io.WriteString(sw.w, "event: "+eventType+"\ndata: "+string(raw)+"\n\n"); werr != nil {
+	frame := append(append(append(append(sw.buf[:0], "event: "...), eventType...), "\ndata: "...), raw...)
+	frame = append(frame, '\n', '\n')
+	if _, werr := sw.w.Write(frame); werr != nil {
 		sw.failed = true
 		return false
 	}
+	sw.buf = frame[:0]
 	sw.flusher.Flush()
 	return true
 }

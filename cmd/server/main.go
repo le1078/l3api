@@ -19,6 +19,11 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	// tzdata：内嵌 IANA 时区库（+450KB）。促销时段判定（upstream.promoLoc）
+	// 要按上游 schedule.timezone 解析 Asia/Shanghai 等时区——镜像可能没有
+	// /usr/share/zoneinfo（LoadLocation 失败 → 回落 UTC+8 固定，上游一旦发
+	// 非 +8 时区窗口判定就偏）。内嵌后恒可解析，与 promoTZ 兜底互补。
+	_ "time/tzdata"
 
 	"github.com/linguo2625469/l3api/internal/apikeys"
 	"github.com/linguo2625469/l3api/internal/auth"
@@ -35,7 +40,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.16.20-panel"
+const appVersion = "1.17.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -169,6 +174,9 @@ func main() {
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
+	// 聊天 SSE 流总时长硬顶（2026-10-20）：防上游 keepalive 拖流无限期占用
+	// 在途名额。缺省 1800s；配 0 = 不设（显式禁用）。
+	up.StreamTotalTimeout = time.Duration(cfg.Upstream.StreamTotalTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
@@ -350,8 +358,13 @@ func main() {
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
-		// 取值大于 MaxBodyMB 在常规带宽下的上传耗时；聊天请求体上限默认 8MB。
-		ReadTimeout: 60 * time.Second,
+		// max_body_mb 缺省/0 = 不限（2026-10-18）后，多图/长上下文会话体可达
+		// 数十 MB，慢链路上传轻松超过 60s → 请求在读体阶段被掐且错误不可读
+		// （客户端只看到连接重置）。2026-10-20 放宽到 300s：仍防无限慢速
+		// 上传（恶意/故障客户端），但不再掐合法大请求。
+		// 若配置了具体上限（MB），按上限动态收紧：8MB 内 60s 足够，
+		// 上限越大给越多时间（每 MB 5s，仍封顶 300s）。
+		ReadTimeout: readTimeoutFor(cfg.Server.MaxBodyMB),
 		// IdleTimeout keep-alive 空闲连接回收：配合 chat 出站 ctx 传播防连接泄漏堆积。
 		// 注意：SSE 流式响应期间连接非空闲，不受此项掐断；不设全局 WriteTimeout
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
@@ -380,7 +393,7 @@ func main() {
 }
 
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL
-// (":7863" 或 "0.0.0.0:7863" → ":7863"；异常输入原样返回）。
+// (":7863" 或 "0.0.0.0:7863" → ":7863"；异常输入原样返回)。
 func panelListenPath(listen string) string {
 	for i := len(listen) - 1; i >= 0; i-- {
 		if listen[i] == ':' {
@@ -388,6 +401,34 @@ func panelListenPath(listen string) string {
 		}
 	}
 	return listen
+}
+
+// readTimeoutFor 按请求体上限推导 http.Server.ReadTimeout（覆盖含 body 的
+// 整个请求读取）。
+//
+//   - maxMB <= 0（不限，2026-10-18 起的缺省口径）：300s。多图/长上下文会话
+//     每轮以 base64 重发历史图片，数十 MB 体在慢链路上传可超过 60s——
+//     旧固定 60s 会把这些合法请求掐在读体阶段（客户端只看到连接重置，
+//     排障时完全看不出是超时）。300s 仍防无限慢速上传。
+//   - maxMB > 0（配了具体上限）：每 MB 5s，最少 60s，封顶 300s。
+//     8MB → 60s（原行为），64MB → 300s。
+func readTimeoutFor(maxMB int) time.Duration {
+	const (
+		floor = 60 * time.Second
+		cap   = 300 * time.Second
+		perMB = 5 * time.Second
+	)
+	if maxMB <= 0 {
+		return cap // 不限：按最宽松档
+	}
+	d := time.Duration(maxMB) * perMB
+	if d < floor {
+		d = floor
+	}
+	if d > cap {
+		d = cap
+	}
+	return d
 }
 
 // isLoopbackListen 判定 listen 地址是否只绑定回环（127.0.0.1 / ::1 / localhost）。

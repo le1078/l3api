@@ -29,6 +29,32 @@ import (
 	"github.com/linguo2625469/l3api/internal/usage"
 )
 
+// clientDisconnected 报告「本次失败是客户端主动断开造成的，不是账号故障」。
+//
+// 判据（任一成立即真）：
+//   - 请求 ctx 已取消/超时（客户端断开连接 → r.Context() Done）；
+//   - 错误本身是 context.Canceled / EPIPE（写客户端失败）。
+//
+// 用途：流式写失败与非流式写失败路径据此跳过 NoteFailures/NoteSuccess——
+// 客户端断开不是账号问题（Codex/中断生成的客户端批量取消时，旧实现会把
+// 健康号连续打出池，池子静默缩水）。上游 EOF/解析失败仍照常罚号。
+func clientDisconnected(r *http.Request, err error) bool {
+	if r != nil && r.Context().Err() != nil {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	// 写客户端失败的典型错误（broken pipe / connection reset）。
+	msg := err.Error()
+	return strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "client disconnected")
+}
+
 // Config handler 依赖。
 type Config struct {
 	Pool      *pool.Pool
@@ -715,33 +741,34 @@ func (h *Handler) activeFreePromo(realm, bareModel string) *upstream.ModelPromot
 
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	// OpenAI 原生端点：读体 + peek，随后交 doChat 轮转核心（OpenAI sink 恒等输出）。
+	// OpenAI 原生端点：读体 + 单次解析事实，随后交 doChat 轮转核心（OpenAI sink 恒等输出）。
 	body, ok := h.readChatBody(w, r, writeOpenAIError)
 	if !ok {
 		return
 	}
-	var peek struct {
-		Stream bool   `json:"stream"`
-		Model  string `json:"model"`
-	}
-	_ = json.Unmarshal(body, &peek)
+	// bodyFacts 一次解析产出 stream/model/工具名单/日志 model（2026-10-20 合并：
+	// 原先这里 peek 一次、doChat 内再解析 6 次）。
+	facts := bodyFacts(body)
 	// "@paid" 后缀（free_guard 单次强制付费放行阀）在入口剥：doChat/白名单/粘性/
 	// 记账全按剥后名处理。sink 展示名用剥后名（客户端看到的响应 model 无后缀）。
-	cleanModel, forcePaid := splitPaidSuffix(peek.Model)
+	cleanModel, forcePaid := splitPaidSuffix(facts.Model)
 	if forcePaid {
 		// 出站 body 同步改写：否则 doChat 里 bareModel==reqModel 跳过重写，
 		// 上游收到带后缀的模型名 → 11102。
 		body = rewriteModel(body, cleanModel)
 	}
-	h.doChat(w, r, body, peek.Stream, cleanModel, forcePaid, newOpenAISink())
+	h.doChat(w, r, body, facts.Stream, cleanModel, forcePaid, newOpenAISink(), facts)
 }
 
 // doChat 轮转核心（v1.11 从 chatCompletions 抽取）：选号/粘性/换号/错误分类/
 // 记账与协议无关；三个协议输出点经 sink 分发（OpenAI=恒等，Anthropic/Responses=
 // internal/protocol 翻译）。stream/reqModel 由调用方从各协议请求解析。
+// facts 是调用方单次解析出的请求体事实（bodyFacts）；2026-10-20 起 doChat 不再
+// 自行解析 body（原先 6 次 unmarshal 全合并到调用方一次）。facts 零值时按
+// 「空 model/无名单/无粘性」继续——测试与内部调用方可传零值。
 // forcePaid = 请求模型名带 "@paid" 后缀（调用方已剥离）：本请求绕过免费额度守护
 // （free_guard），照常计费——守护 key 的单次付费放行阀。
-func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, stream bool, reqModel string, forcePaid bool, sink *chatSink) {
+func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, stream bool, reqModel string, forcePaid bool, sink *chatSink, facts ChatFacts) {
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
@@ -750,7 +777,8 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 	// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的
 	// tools」与「会话历史里出现过的工具名」两个来源——实测 tools 声明会在
 	// 中转环节丢失，只认前者会让修复层在最需要它的场景下失效。
-	declaredTools := upstream.ToolNameAllowlist(body)
+	// 名单由调用方单次解析产出（facts.DeclaredTools，合并前此处独自 unmarshal）。
+	declaredTools := facts.DeclaredTools
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
@@ -784,7 +812,8 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), body, stream)
+	// model 用调用方解析出的 facts.LogModel（合并前此处独自 parseModelFromBody）。
+	st := newChatStat(time.Now(), facts.LogModel, stream)
 	defer st.done()
 	// 指标（v1.11）：请求计数 + 全时长直方图（realm 解析后才能打 label，此处 defer）。
 	reqStart := time.Now()
@@ -806,7 +835,8 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
-	sessKey := session.ExtractKey(body)
+	// sessKey 由调用方单次解析产出（facts.SessionKey，合并前此处独自 ExtractKey）。
+	sessKey := facts.SessionKey
 	stickyUID := ""
 	if h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
@@ -827,8 +857,9 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 	}
 
 	// gateway_hint 判定所需的请求形态（image_url part）：在改写前取（与 turnKey
-	// 同理）。11133「模型不支持图片」指向的前提。
-	reqHasImage := hasImagePart(body)
+	// 同理）。11133「模型不支持图片」指向的前提。facts.HasImage 由调用方解析产出
+	// （合并前此处独自 hasImagePart）。
+	reqHasImage := facts.HasImage
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
 	var heldUID string
@@ -932,22 +963,25 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 		}
 	}
 
-	// 系统提示词改写（出站前、轮转前；每个请求一次）。
+	// 系统提示词改写 + outbound model 前缀剥离，一次 JSON 往返完成（2026-10-20
+	// 优化：原先 prompt.Rewrite 与 rewriteModel 各自全量解编一遍，700KB body
+	// 白付一次往返；两者总是相邻执行，合并零语义变化）。
 	//   - custom：用自有提示词替换客户端 system/developer（从源头消灭 system 指纹误报）。
 	//   - passthrough + 降级期：换 Degraded 中性提示词直达，不再先撞 400。
 	//   - passthrough 非降级期：透传客户端原始 system（不改写）。
+	// model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，上游不认前缀
+	// （global 账号也请求裸模型名）。裸名时 bareModel==reqModel，本步零操作。
 	degradedApplied := false
-	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
-		body = prompt.Rewrite(body, h.cfg.PromptText)
-	} else if h.cfg.PromptMode == "passthrough" && h.degrade.Active() {
-		body = prompt.Rewrite(body, prompt.Degraded)
+	switch {
+	case h.cfg.PromptMode == "custom" && h.cfg.PromptText != "":
+		body = prompt.RewriteAndModel(body, h.cfg.PromptText, bareModel)
+	case h.cfg.PromptMode == "passthrough" && h.degrade.Active():
+		body = prompt.RewriteAndModel(body, prompt.Degraded, bareModel)
 		degradedApplied = true
-	}
-
-	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
-	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==reqModel 恒等。
-	if bareModel != reqModel {
-		body = rewriteModel(body, bareModel)
+	default:
+		if bareModel != reqModel {
+			body = rewriteModel(body, bareModel)
+		}
 	}
 
 	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID（对话轮级）聚合请求，
@@ -960,7 +994,7 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 	//     粘性 key 进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID），
 	//     无 user 消息时退化成本请求级随机——轮转内捕获一次即共享；
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
-	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
+	chatMeta := upstream.ChatMeta{ConversationID: facts.ConversationID}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
 	} else if sessKey != "" {
@@ -1012,6 +1046,16 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 				return
 			}
 			st.status = http.StatusServiceUnavailable
+			// 选号失败归因（2026-10-20）：把「候选账号各自因何被排除」记进
+			// 指标与一行日志——503 no_healthy_account 此前只有一条 notify
+			//（未配即全静默），池子缩水时完全看不出是冷却/熔断/额度尽还是域不匹配。
+			if h.m != nil && h.m.pickFails != nil {
+				reason := h.cfg.Pool.PickFailureReason(tried, bareModel, realm, freeGuard)
+				h.m.pickFails.Inc("realm", realmLabelForMetrics(realm), "reason", reason)
+				if chatLogEnabled {
+					log.Printf("chat pick failed: realm=%s model=%s reason=%s", realm, bareModel, reason)
+				}
+			}
 			break
 		}
 		st.uid = acct.UID
@@ -1024,9 +1068,12 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 			if stickyUID != "" && acct.UID == stickyUID {
 				unbindSticky()
 			}
-			if !rotateBackoff(i, h.cfg.MaxRotate, r.Context()) {
-				// 客户端已断连：换号重试无意义，终止轮转走末端错误透传。
-				break
+			// 本地调度竞争（名额被并发抢走）不sleep退避（2026-10-20）：
+			// 没打上游、没有可等待的对方——白睡 500ms/1s 只是拖长本请求的
+			// 失败时延。仅最后一轮前不睡（rotateBackoff 既有语义），中间轮
+			// 也跳过：换下一个号是纯本地操作，微秒级完成。
+			if r.Context().Err() != nil {
+				break // 客户端已断连：换号重试无意义
 			}
 			continue // 最后一个名额被并发抢走 → 换号
 		}
@@ -1034,6 +1081,11 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
+			// 客户端已断开：刷新与换号都无意义（省一次上游 refresh 调用）。
+			if r.Context().Err() != nil {
+				st.status = 499
+				return
+			}
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
 				lastErr = err
 				var ue *upstream.Error
@@ -1073,6 +1125,14 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 			status = uerr.Status
 		}
 		if uerr == nil && terr != nil {
+			// 客户端主动断开（Ctrl-C / 中断生成 / 下游超时取消）：不是账号故障，
+			// 不罚号不喂连败（2026-10-20 修复：此前一律 NoteFailures，批量取消
+			// 请求的客户端会把健康号连续打出池）。只记尝试（用量视图可见）。
+			if clientDisconnected(r, terr) {
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+				st.status = 499 // nginx 口径：客户端关闭请求
+				return
+			}
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
@@ -1103,7 +1163,9 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
 			if kind == upstream.ErrContentBlocked && h.cfg.PromptMode == "passthrough" && !degradedApplied {
 				h.degrade.Trigger()
-				body = prompt.Rewrite(body, prompt.Degraded)
+				// 降级重试：改写 system 提示词（同一次往返里把 model 剥回裸名，
+				// 防止带前缀名出站——prompt.Rewrite 不动 model 字段）。
+				body = prompt.RewriteAndModel(body, prompt.Degraded, bareModel)
 				degradedApplied = true
 				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 				releaseHeld()
@@ -1209,6 +1271,13 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 				return
 			}
 			if serr != nil {
+				// 客户端主动断开（写失败）：中性账——不记成功也不罚号
+				// （2026-10-20：批量取消的客户端此前会把健康号打出池）。
+				if clientDisconnected(r, serr) {
+					recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+					st.status = 499
+					return
+				}
 				// 空流/写失败等本地异常：不记成功，喂连败兜底（单次不罚）。
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
 				h.cfg.Pool.NoteFailures(acct.UID)
@@ -1242,6 +1311,12 @@ func (h *Handler) doChat(w http.ResponseWriter, r *http.Request, body []byte, st
 		}
 		if err != nil {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			// 客户端主动断开（聚合读取消）：中性账——不罚号（2026-10-20，
+			// 与流式路径同口径）。
+			if clientDisconnected(r, err) {
+				st.status = 499
+				return
+			}
 			// 流内 error 帧：与流式路径同口径做 FrameKind 分类冷却（6004 模型级
 			// 冷却、硬信用冷却等）——此前一律 NoteFailures + 502，错误账号/模型
 			// 不被冷却，下个请求继续撞同一坑。
@@ -1431,6 +1506,16 @@ func rotateBackoff(i, maxRotate int, ctx context.Context) bool {
 // 携带的模型名。uerr 是 ChatStreamContext 返回的分类信封（可携带 RetryAfter）；
 // 零值/防御路径下为 nil，冷却时长回落既有计算。
 func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error) {
+	// 上游错误分类计数（2026-10-20）：在唯一入口按 Kind 记账——attempts 的
+	// outcome 只有 success/fail，429/5xx/超时/内容拦截全混在 fail 里看不出
+	// 失败构成；这个计数器让 Grafana 能按 kind 分维看。
+	if h.m != nil && h.m.upstreamErrs != nil && kind != upstream.ErrNone {
+		status := 0
+		if uerr != nil {
+			status = uerr.Status
+		}
+		h.m.upstreamErrs.Inc("kind", kind.String(), "status", statusLabel(status))
+	}
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），

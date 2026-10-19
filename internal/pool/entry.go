@@ -192,6 +192,9 @@ type entry struct {
 	disabled        bool
 	reason          string
 	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	// lastPrune 最近一次惰性清理时刻（pick 写锁路径按 pruneInterval 节流，
+	// 2026-10-20）：三个 prune map 的遍历不必每次 pick 都做一遍。
+	lastPrune time.Time
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -375,6 +378,23 @@ func (e *entry) pruneExpiredFreeExhaust(now time.Time) {
 	for m, until := range e.freeExhaust {
 		if until.IsZero() || !now.Before(until) {
 			delete(e.freeExhaust, m)
+		}
+	}
+}
+
+// pruneExpiredModelCost 删除 modelCost 中超过 modelCostTTL 的条目（惰性清理，
+// 2026-10-20 补：modelCooldowns/freeExhaust 都有 prune，唯独 modelCost 没有——
+// 客户端传随机模型名时每小时每 uid 多一条永不删除的观测，state.json 与
+// 面板台账无界增长）。与另两个 prune 同模式：pick 写锁路径调用。
+// 调用方必须已持有 p.mu 写锁。
+func (e *entry) pruneExpiredModelCost(now time.Time) {
+	if len(e.modelCost) == 0 {
+		return
+	}
+	cutoff := now.Add(-modelCostTTL)
+	for m, mc := range e.modelCost {
+		if mc.LastSeen.Before(cutoff) {
+			delete(e.modelCost, m)
 		}
 	}
 }

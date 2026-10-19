@@ -310,14 +310,18 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"auth_required":   p.apiKey() != "",
 		"redis_mode":      p.cfg.RedisMode,
 		"sticky_sessions": sticky,
-		"total":           total,
-		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
-		"in_flight_full":  inFlightFull,
-		"in_flight":       inFlight,
-		"today_requests":  todayReq,
-		"today_tokens":    todayTok,
+		// state_persist_fails 连续落盘失败次数（2026-10-20）：>0 即磁盘满/
+		// 权限丢失——state.json 写不进去，重启丢全部冷却/禁用状态。此前只有
+		// 节流日志，面板完全看不出。
+		"state_persist_fails": p.cfg.Pool.PersistFails(),
+		"total":               total,
+		"healthy":             healthy,
+		"cooling":             cooling,
+		"disabled":            disabled,
+		"in_flight_full":      inFlightFull,
+		"in_flight":           inFlight,
+		"today_requests":      todayReq,
+		"today_tokens":        todayTok,
 		// today_credits 今日积分消耗（今日小时桶里 usage.credit 之和，v1.16.9）。
 		// 保留两位小数：上游 credit 是小数，浮点累加后的尾数（12.340000000002）
 		// 直接透出会让前端格式化很别扭。

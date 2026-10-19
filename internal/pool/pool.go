@@ -226,10 +226,20 @@ func (p *Pool) inFlightLimit(e *entry) int {
 
 // SetStore 注入池状态快照镜像（redisstore.Store）。nil 表示不镜像（纯本地恢复）。
 // 必须在 SyncToDir 之前调用，使"择新恢复"发生在账号对齐之前。
+//
+// store 字段的读必须走 storeRef()（持 RLock）——直接读 p.store 与这里的持锁写
+// 构成 data race（-race 可复现，2026-10-20 修复）。
 func (p *Pool) SetStore(s StoreSnapshotter) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.store = s
+}
+
+// storeRef 持 RLock 读 store 快照（供 RestoreFromSnapshot / saveLocked 使用）。
+func (p *Pool) storeRef() StoreSnapshotter {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.store
 }
 
 // RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。

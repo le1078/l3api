@@ -10,6 +10,11 @@ import (
 	"github.com/linguo2625469/l3api/internal/auth"
 )
 
+// pruneInterval 惰性清理的最小间隔（2026-10-20）：三个 prune map 的遍历
+// 按 entry.lastPrune 节流到每分钟一次。清理是防膨胀兜底而非正确性依赖
+//（status 只读路径天然跳过过期项），1 分钟粒度对 6h TTL 的 modelCost 无差别。
+const pruneInterval = time.Minute
+
 // Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知缺省账号级）。
 // 需要请求级轮换（tried）或分池（realm）时用 PickExcludingForRealm。
 func (p *Pool) Pick() *auth.Auth {
@@ -50,6 +55,82 @@ func (p *Pool) PickExcludingForBrandGuarded(tried map[string]bool, reqModel, rea
 // （粘性键只在同品牌请求间复用，跨品牌粘性键不共享——见 handler 会话键构成）。
 func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	return p.pick(tried, reqModel, realm)
+}
+
+// PickFailureReason 诊断「为什么选不出号」（2026-10-20）：按 pickBrand 的同一
+// 套谓词逐账号统计排除原因，返回计数最大的那个原因标签。
+//
+// 用途：handler 在 503 no_healthy_account 时把它记进日志与指标
+// （l3api_chat_pick_failures_total{reason}）——此前这种「池子静默缩水」
+// 只有一条通知（未配 notify 即全静默），运维看不到候选账号各自因何被排除。
+//
+// 返回值（与谓词顺序对应，先命中先归因）：
+//
+//	disabled            账号被禁用
+//	paused               运维暂停选号
+//	cooling             账号级冷却中（429 退避/熔断/degrade）
+//	breaker             熔断中
+//	model_cooldown      该模型被 6004 限额（模型级冷却）
+//	credit_floor        积分低于保底线
+//	free_exhaust        免费额度已尽（守护选号时）
+//	in_flight_full      在途占满
+//	realm_mismatch      品牌/域不匹配
+//	none                全部通过（不应出现在失败路径——防御）
+//	empty               池为空（无账号可归因）
+//
+// 只读快照语义：内部取 RLock 遍历，与 pickBrand 之间无原子性保证（诊断用，
+// 不参与选号决策）。
+func (p *Pool) PickFailureReason(tried map[string]bool, reqModel, realm string, guardFreeExhaust bool) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.byUID) == 0 {
+		return "empty"
+	}
+	now := time.Now()
+	counts := map[string]int{}
+	realmOK := func(e *entry) bool {
+		if brandRealm(realm) {
+			return e.a.Brand() == realm
+		}
+		if e.a.Brand() != "codebuddy" {
+			return false
+		}
+		return realm == "" || e.a.Realm() == realm
+	}
+	for uid, e := range p.byUID {
+		if tried != nil && tried[uid] {
+			continue // 已试过：不算排除原因（请求级轮换的正常状态）
+		}
+		switch {
+		case e.disabled:
+			counts["disabled"]++
+		case e.paused:
+			counts["paused"]++
+		case !realmOK(e):
+			counts["realm_mismatch"]++
+		case !e.breakerUntil.IsZero() && now.Before(e.breakerUntil):
+			counts["breaker"]++
+		case !e.until.IsZero() && now.Before(e.until):
+			counts["cooling"]++
+		case reqModel != "" && e.modelCooled(now, reqModel):
+			counts["model_cooldown"]++
+		case reqModel != "" && p.floorBlockedLocked(e, reqModel, now):
+			counts["credit_floor"]++
+		case guardFreeExhaust && e.freeExhaustBlockedLocked(reqModel, now):
+			counts["free_exhaust"]++
+		case p.inFlightFull(e):
+			counts["in_flight_full"]++
+		default:
+			counts["none"]++ // 谓词全过：可能刚好被并发抢走
+		}
+	}
+	best, bestN := "none", -1
+	for k, v := range counts {
+		if v > bestN || (v == bestN && k < best) {
+			best, bestN = k, v
+		}
+	}
+	return best
 }
 
 // pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
@@ -123,8 +204,16 @@ func (p *Pool) pickBrand(tried map[string]bool, reqModel, realm string, guardFre
 		if tried != nil && tried[uid] {
 			continue
 		}
-		e.pruneExpiredModelCooldowns(now) // 惰性清理过期模型级冷却（防 map 膨胀）
-		e.pruneExpiredFreeExhaust(now)    // 惰性清理过期免费额度尽条目（防 map 膨胀）
+		// 惰性清理按「距上次清理 > pruneInterval」节流（2026-10-20）：三个 prune
+		// 原先每次 pick 对每个候选都全量遍历一遍自己的 map——46 账号 × 每请求
+		// 多次 pick，纯浪费持锁时间。清理本身是防膨胀的兜底，1 分钟一次足够
+		//（TTL 6h 的 modelCost 早几分钟清理无差别）。lastPrune 在锁内更新。
+		if now.Sub(e.lastPrune) >= pruneInterval {
+			e.lastPrune = now
+			e.pruneExpiredModelCooldowns(now) // 过期模型级冷却
+			e.pruneExpiredFreeExhaust(now)    // 过期免费额度尽条目
+			e.pruneExpiredModelCost(now)      // 过期成本观测
+		}
 		if !healthyOf(e) {
 			continue
 		}

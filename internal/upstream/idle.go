@@ -1,4 +1,9 @@
 // idle.go 聊天 SSE 流中空闲监控：活跃吐数据续命不掐，静默超过阈值才断流（释放租约）。
+//
+// 2026-10-20 追加流总时长硬顶：空闲监控只看「有没有字节到达」，上游每 N 分钟
+// 吐 1 字节 keepalive 就能永不断流，无限期占用账号在途名额（max_in_flight=8，
+// 几条这样的流就能把池子打满、正常请求全 503）。total>0 时从开流起计时，
+// 到点 cancel——与空闲监控共用同一 cancel 与后台 goroutine。
 package upstream
 
 import (
@@ -43,11 +48,15 @@ func (b *idleMonitoringBody) idleFor() time.Duration {
 	return time.Since(b.lastRead)
 }
 
-// monitorBody 若 idle<=0 直接返回原底流（禁用空闲监控）；
-// 否则包上流中空闲监控。计时从返回 body 之后开始——首字节阶段由
-// Transport.ResponseHeaderTimeout 管，这里不抢跑。
-func monitorBody(rc io.ReadCloser, idle time.Duration, cancel context.CancelFunc) io.ReadCloser {
-	if idle <= 0 {
+// monitorBody 若 idle<=0 且 total<=0 直接返回原底流（禁监控）；
+// 否则包上流中监控（idle>0 管静默、total>0 管总时长，二者至少其一启用）。
+// 计时从返回 body 之后开始——首字节阶段由 Transport.ResponseHeaderTimeout
+// 管，这里不抢跑。
+//
+// total<=0 表示不设总时长硬顶（长回答合法时长可达数分钟，默认由 idle 兜底）；
+// 需要硬顶的上游路径可显式传值（见 MaxStreamTotalDuration）。
+func monitorBody(rc io.ReadCloser, idle, total time.Duration, cancel context.CancelFunc) io.ReadCloser {
+	if idle <= 0 && total <= 0 {
 		return rc
 	}
 	b := &idleMonitoringBody{
@@ -56,14 +65,36 @@ func monitorBody(rc io.ReadCloser, idle time.Duration, cancel context.CancelFunc
 		stopCh:   make(chan struct{}),
 		cancel:   cancel,
 	}
+	// 后台 goroutine 两件事都做：空闲 tick 检查 + 总时长到点 cancel。
+	// 总时长用 absolute deadline 而非「tick 累加」——避免 tick 漂移与
+	// 「刚好在 tick 间隙超时」的边界争议。
+	//
+	// timer/ticker 在 goroutine 内创建并 defer Stop（2026-10-20 踩坑：放
+	// monitorBody 里 defer 会在函数返回时就把它们停掉，goroutine 的 select
+	// 永远等不到事件——idle 监控静默失效、测试挂死）。
 	go func() {
-		t := time.NewTicker(idleTick(idle))
-		defer t.Stop()
+		var deadline <-chan time.Time
+		var tick <-chan time.Time
+		if total > 0 {
+			t := time.NewTimer(total)
+			defer t.Stop()
+			deadline = t.C
+		}
+		if idle > 0 {
+			tk := time.NewTicker(idleTick(idle))
+			defer tk.Stop()
+			tick = tk.C
+		}
 		for {
 			select {
 			case <-b.stopCh:
 				return
-			case <-t.C:
+			case <-deadline:
+				// 流总时长硬顶（2026-10-20）：上游 keepalive 拖流时空闲监控
+				// 永不触发，靠这里强制收流，释放账号在途名额。
+				cancel()
+				return
+			case <-tick:
 				if b.idleFor() > idle {
 					cancel()
 					return

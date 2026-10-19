@@ -248,7 +248,7 @@ func (c *Client) TraeChatStream(ctx context.Context, a *auth.Auth, body []byte, 
 	// 返回（handler 可换号）；拿到 output → 缓冲回放。同步执行：取消语义由 ctx
 	// （客户端断连）与 monitorBody 的 IdleTimeout（流空闲）兜底，queue/progress
 	// 过程事件会刷新空闲计时，不会误掐排队中的请求。
-	src := monitorBody(resp.Body, c.IdleTimeout, cancel)
+	src := monitorBody(resp.Body, c.IdleTimeout, c.StreamTotalTimeout, cancel)
 	tr := &traeSSETranslator{rc: src, cancel: cancel, model: model, id: "chatcmpl-trae-" + uid}
 	if ue := tr.preread(); ue != nil {
 		tr.Close()
@@ -340,6 +340,9 @@ type traeSSETranslator struct {
 
 	// 流内晚期错误（预读窗口后到达）：粘滞到 lateErr，翻译为 OpenAI error 帧
 	// 透传（sse.go 的 error-passthrough 路径原样写出），随后正常 [DONE] 收尾。
+	// pending 放完后由 Read 当错误返回（2026-10-20）——此前 lateErr 只写不读，
+	// Trae 流内 session 失效（code 1001）/额度耗尽（1005/4008）既不冷却也不
+	// 禁用，账号反复被选中、每轮都白烧上游流量。
 	lateErr *Error
 
 	sentRole bool // 首帧 delta.role=assistant 只发一次
@@ -382,6 +385,11 @@ func (t *traeSSETranslator) nextEvent() (string, string, error) {
 	var data strings.Builder
 	for {
 		line, err := t.br.ReadString('\n')
+		// 单行上界（2026-10-20）：trae 帧以 event:/data: 行传输，无换行超长行
+		// 只可能是上游故障——超限断流（Read 侧走既有错误路径）。
+		if lerr := CheckSSELineLen(line, 0); lerr != nil {
+			return "", "", lerr
+		}
 		if len(line) > 0 {
 			trimmed := strings.TrimRight(line, "\r\n")
 			if strings.HasPrefix(trimmed, "event:") {
@@ -412,6 +420,17 @@ func (t *traeSSETranslator) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	if t.done {
+		// 晚期错误（2026-10-20）：pending 已放完（error 帧 + [DONE] 都交给
+		// 客户端了），此时才把粘滞的 lateErr 当 Read 错误返回——上游侧的
+		// StreamHint/客户端写循环据此走失败路径，handler 的
+		// errors.As(serr, &sfe) 之前的 err 分支即可按 *Error 分类罚号。
+		// 放在这里而不是 emitErrorFrame 当场返回：客户端必须能读到 error 帧
+		// 和 [DONE]（否则看到的是连接截断，不是上游真实错误）。
+		if t.lateErr != nil {
+			err := t.lateErr
+			t.lateErr = nil // 一次性：后续 Read 恒 EOF，不重复报错
+			return 0, err
+		}
 		return 0, io.EOF
 	}
 	if t.err != nil {

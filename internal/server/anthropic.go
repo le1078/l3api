@@ -48,7 +48,10 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if !h.enforceModelAllowlistAnthropic(w, r, cleanModel) {
 		return
 	}
-	h.doChat(w, r, chatBody, req.Stream, cleanModel, forcePaid, newAnthropicSink(cleanModel))
+	// bodyFacts 单次解析（2026-10-20）：Anthropic 请求体已转成 OpenAI 形态，
+	// 与 chatCompletions 同路径解析；marshaled 的 chatBody 恒合法 JSON。
+	facts := bodyFacts(chatBody)
+	h.doChat(w, r, chatBody, req.Stream, cleanModel, forcePaid, newAnthropicSink(cleanModel), facts)
 }
 
 // enforceModelAllowlistAnthropic 只查模型白名单（错误形态 Anthropic）。

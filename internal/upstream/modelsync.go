@@ -197,25 +197,22 @@ func resetModelSyncForTest() {
 var qoderModelListURL = "https://gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1"
 
 // ProbeQoderModels 探测 Qoder 官方 chat 组模型目录（GET model/list）。
-// jobToken 临期先滚动刷新（与 QoderChatStream 同链路）。返回上游原始顺序。
+// jobToken 临期先滚动刷新（与 QoderChatStream 同链路，共用同一单飞组）。
+// 返回上游原始顺序。
 func (c *Client) ProbeQoderModels(ctx context.Context, a *auth.Auth) ([]QoderModel, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// 单飞刷新（2026-10-20）：与 chat/checkin/RefreshIfNeeded 共用，防同账号
+	// 并发路径重复打 refresh 端点互相覆盖。
 	if a.NeedsRefresh(qoderRefreshSkew) {
 		if a.RefreshToken == "" {
 			return nil, &Error{Kind: ErrSessionDead, Status: 401, Msg: "qoder refresh_token missing"}
 		}
-		sess, err := c.qoderRefreshJobToken(ctx, a.RefreshToken)
-		if err != nil {
-			return nil, err
+		_ = c.qoderRefreshSingleflight(a)
+		if a.NeedsRefresh(qoderRefreshSkew) {
+			return nil, &Error{Kind: ErrSessionDead, Status: 401, Msg: "qoder token refresh failed"}
 		}
-		a.Lock()
-		a.AccessToken = sess.JobToken
-		a.RefreshToken = sess.RefreshToken
-		a.ExpiresAt = sess.ExpiresAt.Unix()
-		a.Unlock()
-		_ = a.SaveAtomic() // 落盘失败不阻断（下次冷交换）
 	}
 	if a.UID == "" || a.AccessToken == "" {
 		return nil, &Error{Kind: ErrSessionDead, Status: 401, Msg: "qoder auth incomplete (uid/jobToken missing)"}

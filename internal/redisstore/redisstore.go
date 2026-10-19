@@ -126,6 +126,14 @@ type Upstash struct {
 	wg sync.WaitGroup
 	// pending 已提交但尚未抢到写槽的写数量（有界排队口径，见 goWrite）。
 	pending atomic.Int64
+	// writeErrs / dropped 可观测计数器（2026-10-20）：此前写失败仅 debug 日志
+	//（生产 log level 下不可见）、排队超限直接静默丢弃——Redis 慢/宕时
+	// 运维完全看不出镜像已经失效。Stats() 供 /status 与 /metrics 暴露。
+	writeErrs atomic.Int64
+	dropped   atomic.Int64
+	// lastErrAt 最近一次写失败时刻（零值 = 无失败）。供「Redis 是否刚失联」
+	// 的告警判定。
+	lastErrAt atomic.Int64 // unix nano
 }
 
 // maxPendingWrites 排队写上限（不含正在执行的）。超出即丢弃最新写：
@@ -152,6 +160,10 @@ func (u *Upstash) goWrite(fn func()) {
 	if u.pending.Add(1) > maxPendingWrites {
 		u.pending.Add(-1)
 		u.wg.Done()
+		// 计数 + 首末打点（2026-10-20）：丢弃此前完全静默——Redis 慢/宕时
+		// 运维看不到镜像已在丢数据。
+		u.dropped.Add(1)
+		u.noteDropped()
 		return
 	}
 	go func() {
@@ -210,6 +222,52 @@ func (u *Upstash) closeClient() error {
 
 func bindKey(key string) string { return bindPrefix + key }
 
+// noteWriteErr 记录一次异步写失败（计数 + 打点 + 升级到 WARN 日志）。
+// 2026-10-20：此前三处写失败只打 debug 日志（生产不可见），Redis 失联时
+// 运维完全看不出镜像已失效。计数经 Stats() 暴露给 /status 与 /metrics。
+func (u *Upstash) noteWriteErr(op string, err error) {
+	u.writeErrs.Add(1)
+	u.lastErrAt.Store(time.Now().UnixNano())
+	// 升级为 WARN：debug 级别在默认 log 配置下不输出。限流防刷屏（Redis 宕时
+	// 每请求一次写 = 每秒多条）——用 dropped/writeErrs 总量说话，不逐条刷。
+	log.Printf("[redisstore] WARN: %s failed (%d total): %v", op, u.writeErrs.Load(), err)
+}
+
+// noteDropped 记录一次排队丢弃（计数 + 限量日志）。
+func (u *Upstash) noteDropped() {
+	n := u.dropped.Add(1)
+	if n == 1 || n%100 == 0 {
+		log.Printf("[redisstore] WARN: write dropped due to backlog (total %d) — redis slow/down?", n)
+	}
+}
+
+// Stats redisstore 可观测快照（供 /status 与 /metrics）。
+type Stats struct {
+	// WriteErrs 异步写失败累计（SetBind/DelBind/SaveState）。
+	WriteErrs int64
+	// Dropped 因排队超限丢弃的写累计。
+	Dropped int64
+	// Pending 当前排队中的写（瞬时）。
+	Pending int64
+	// LastErrAtUnix 最近一次写失败时刻（0 = 无失败）。
+	LastErrAtUnix int64
+	// Healthy 粗略健康判定：最近 60s 内无写失败。
+	Healthy bool
+}
+
+// Stats 返回当前计数快照（零值 Upstash 也可安全调用）。
+func (u *Upstash) Stats() Stats {
+	last := u.lastErrAt.Load()
+	healthy := last == 0 || time.Since(time.Unix(0, last)) < 60*time.Second
+	return Stats{
+		WriteErrs:     u.writeErrs.Load(),
+		Dropped:       u.dropped.Load(),
+		Pending:       u.pending.Load(),
+		LastErrAtUnix: last,
+		Healthy:       healthy,
+	}
+}
+
 // SetBind 异步镜像粘性会话绑定。
 func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 	if ttl <= 0 {
@@ -219,7 +277,7 @@ func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := u.client.Set(ctx, bindKey(key), uid, ttl).Err(); err != nil {
-			log.Printf("[redisstore] debug: SetBind %s: %v", key, err)
+			u.noteWriteErr("SetBind", err)
 		}
 	})
 }
@@ -230,7 +288,7 @@ func (u *Upstash) DelBind(key string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := u.client.Del(ctx, bindKey(key)).Err(); err != nil {
-			log.Printf("[redisstore] debug: DelBind %s: %v", key, err)
+			u.noteWriteErr("DelBind", err)
 		}
 	})
 }
@@ -241,7 +299,7 @@ func (u *Upstash) SaveState(data []byte) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := u.client.Set(ctx, stateKey, data, keyTTL).Err(); err != nil {
-			log.Printf("[redisstore] debug: SaveState: %v", err)
+			u.noteWriteErr("SaveState", err)
 		}
 	})
 }

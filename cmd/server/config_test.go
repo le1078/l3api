@@ -192,7 +192,9 @@ func TestBadBreakerCooldown(t *testing.T) {
 }
 
 func TestUpstreamTimeoutDefaults(t *testing.T) {
-	// 默认：header 回落 timeout，idle 回落 300。
+	// 默认（2026-10-20 修正）：header **独立回落 60s**（原回落 timeout=120，
+	// 比 transport.go 选的 60s 慢一倍，MaxRotate=3 最坏轮转从 3min 变 6min）；
+	// idle 回落 300；stream_total 回落 1800（30min 硬顶）。
 	c := Default()
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
@@ -200,16 +202,19 @@ func TestUpstreamTimeoutDefaults(t *testing.T) {
 	if c.Upstream.TimeoutSeconds != 120 {
 		t.Errorf("timeout_seconds=%d want 120", c.Upstream.TimeoutSeconds)
 	}
-	if c.Upstream.HeaderTimeoutSeconds != 120 {
-		t.Errorf("header_timeout_seconds=%d want fallback 120", c.Upstream.HeaderTimeoutSeconds)
+	if c.Upstream.HeaderTimeoutSeconds != 60 {
+		t.Errorf("header_timeout_seconds=%d want independent fallback 60", c.Upstream.HeaderTimeoutSeconds)
 	}
 	if c.Upstream.IdleTimeoutSeconds != 300 {
 		t.Errorf("idle_timeout_seconds=%d want fallback 300", c.Upstream.IdleTimeoutSeconds)
 	}
+	if c.Upstream.StreamTotalTimeoutSeconds != 1800 {
+		t.Errorf("stream_total_timeout_seconds=%d want fallback 1800", c.Upstream.StreamTotalTimeoutSeconds)
+	}
 }
 
-func TestUpstreamHeaderFallsBackToTimeout(t *testing.T) {
-	// 只设 timeout_seconds：header 回落同值，idle 回落 300。
+func TestUpstreamHeaderIndependentOfTimeout(t *testing.T) {
+	// 只设 timeout_seconds：header **不跟随**（独立 60 兜底），idle 回落 300。
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
 	os.WriteFile(fp, []byte(`{"upstream":{"timeout_seconds":60}}`), 0o600)
@@ -218,10 +223,36 @@ func TestUpstreamHeaderFallsBackToTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.Upstream.HeaderTimeoutSeconds != 60 {
-		t.Errorf("header_timeout_seconds=%d want fallback 60", c.Upstream.HeaderTimeoutSeconds)
+		t.Errorf("header_timeout_seconds=%d want 60", c.Upstream.HeaderTimeoutSeconds)
 	}
 	if c.Upstream.IdleTimeoutSeconds != 300 {
 		t.Errorf("idle_timeout_seconds=%d want fallback 300", c.Upstream.IdleTimeoutSeconds)
+	}
+	if c.Upstream.StreamTotalTimeoutSeconds != 1800 {
+		t.Errorf("stream_total_timeout_seconds=%d want fallback 1800", c.Upstream.StreamTotalTimeoutSeconds)
+	}
+}
+
+func TestUpstreamStreamTotalExplicitAndNegative(t *testing.T) {
+	// 显式值保留；负数归一为 0（禁用硬顶）。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"stream_total_timeout_seconds":900}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.StreamTotalTimeoutSeconds != 900 {
+		t.Errorf("stream_total=%d want 900", c.Upstream.StreamTotalTimeoutSeconds)
+	}
+	fp2 := filepath.Join(dir, "c2.json")
+	os.WriteFile(fp2, []byte(`{"upstream":{"stream_total_timeout_seconds":-1}}`), 0o600)
+	c2, err := Load(fp2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.Upstream.StreamTotalTimeoutSeconds != 0 {
+		t.Errorf("负数应归一为 0（禁用），实际 %d", c2.Upstream.StreamTotalTimeoutSeconds)
 	}
 }
 

@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      # 国内代理：go mod 拉取走 goproxy.cn（与本机开发口径一致）。
+      - name: Env
+        run: echo "GOPROXY=https://goproxy.cn,direct" >> "$GITHUB_ENV"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        # -race 与 Dockerfile 内置质量门同口径；超时 10min 防慢 runner 假失败。
+        run: go test -race -timeout 10m ./...
+
+      # 版本号一致性：appVersion 常量 / 面板 app.js?v / commit message 三处漂移
+      # 是历史事故（2026-10-12 漏改 appVersion 导致面板显示错版本），CI 拦住。
+      - name: Version consistency
+        run: |
+          set -euo pipefail
+          const_v="$(grep -oP 'appVersion\s*=\s*"\K[0-9][0-9.]*' cmd/server/main.go | head -1)"
+          panel_v="$(grep -oP 'app\.js\?v=\K[0-9][0-9.]*' internal/panel/index.html | head -1)"
+          echo "appVersion=$const_v  app.js?v=$panel_v"
+          if [ -z "$const_v" ] || [ -z "$panel_v" ]; then
+            echo "::error::版本号提取失败（常量或面板 query 串缺失）"; exit 1
+          fi
+          if [ "$const_v" != "$panel_v" ]; then
+            echo "::error::版本号不一致：cmd/server/main.go appVersion=$const_v vs internal/panel/index.html app.js?v=$panel_v"; exit 1
+          fi
+          echo "版本号一致：$const_v"

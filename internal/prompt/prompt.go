@@ -91,3 +91,63 @@ func Rewrite(body []byte, systemPrompt string) []byte {
 	}
 	return out
 }
+
+// RewriteAndModel Rewrite + model 替换的合并版（2026-10-20 优化）：一次
+// unmarshal/marshal 完成两件事，省掉原先「prompt.Rewrite 全量往返 →
+// rewriteModel 再全量往返」的第二次 JSON 编解码（700KB body ≈ 0.75ms + 400KB
+// 垃圾/请求）。
+//
+// 语义 = Rewrite(body, systemPrompt) 后再把 model 字段替换为 bare：
+//   - systemPrompt 为空 → 只换 model（不插 system 消息）；
+//   - bare 为空/等于原 model → 只做 Rewrite（不动 model 字段）。
+// 解析失败 → 原样返回（与 Rewrite 一致的「绝不失败」口径）。
+func RewriteAndModel(body []byte, systemPrompt, bare string) []byte {
+	if len(body) == 0 || (systemPrompt == "" && bare == "") {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	if systemPrompt != "" {
+		obj["messages"] = rewriteMessages(obj["messages"], systemPrompt)
+	}
+	if bare != "" {
+		if cur, ok := obj["model"].(string); ok && cur != bare {
+			obj["model"] = bare
+		}
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// rewriteMessages Rewrite 的 messages 改写体（抽出供合并版复用）。
+func rewriteMessages(raw any, systemPrompt string) any {
+	msgs, ok := raw.([]any)
+	if !ok {
+		// 无 messages 字段或类型不符 → 插入单条 system 后原样保留其余字段。
+		return []any{map[string]any{"role": "system", "content": systemPrompt}}
+	}
+	// 过滤掉所有 system/developer 消息，保留 user/assistant/tool 及其他角色。
+	kept := make([]any, 0, len(msgs)+1)
+	for _, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			kept = append(kept, m)
+			continue
+		}
+		role, _ := mm["role"].(string)
+		if role == "system" || role == "developer" {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	// 头部插入单条 system 消息（prepend 避免整体重排语义）。
+	return append(
+		[]any{map[string]any{"role": "system", "content": systemPrompt}},
+		kept...,
+	)
+}

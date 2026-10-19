@@ -183,14 +183,40 @@ func (c *Client) QoderRefreshIfNeeded(a *auth.Auth) error {
 	if a.RefreshToken == "" {
 		return fmt.Errorf("qoder refresh_token missing (uid=%s)", a.UID)
 	}
-	sess, err := c.qoderRefreshJobToken(context.Background(), a.RefreshToken)
-	if err != nil {
-		return err
-	}
-	a.Lock()
-	a.AccessToken = sess.JobToken // AccessToken 滚动为当前 jobToken
-	a.RefreshToken = sess.RefreshToken
-	a.ExpiresAt = sess.ExpiresAt.Unix()
-	a.Unlock()
-	return a.SaveAtomic()
+	return c.qoderRefreshSingleflight(a)
+}
+
+// qoderRefreshSingleflight qoder jobToken 滚动的唯一实现（2026-10-20 单飞化）。
+//
+// 四条调用路径（chat / ProbeQoderModels / checkin / RefreshIfNeeded）共用：
+// 同账号并发调用只有 leader 真打 refresh 端点，follower 等 leader 写回后
+// 直接看到新 token。此前四条路径各自「NeedsRefresh → 刷新」，同账号 8 并发
+// 进过期窗口时 8 次滚动刷新互相覆盖（后写覆盖先写），且同 uid 短时多次
+// 刷 token 在风控视角是异常行为。
+//
+// ctx 仅用于 leader 的 HTTP 调用；follower 等待不感知 ctx 取消（刷新通常
+// <2s，等待有界由上游 HTTP.Timeout 保证）。
+func (c *Client) qoderRefreshSingleflight(a *auth.Auth) error {
+	RefreshAuthOnce(a.UID, func() {
+		// fn 内不再判 NeedsRefresh：调用方已判过，且本函数只被「需要刷新」
+		// 的路径调用（QoderRefreshIfNeeded 也在调用前判过）。follower 醒来
+		// 时 auth 已是新 token，无需再刷。
+		if a.RefreshToken == "" {
+			return // 无 refresh_token：保持旧 token，由调用方按需报错
+		}
+		sess, err := c.qoderRefreshJobToken(context.Background(), a.RefreshToken)
+		if err != nil {
+			return // 刷新失败：保持旧 token（调用方随后打上游会拿到 401，
+			// 走 ErrSessionDead 阈值化——与旧行为一致）
+		}
+		a.Lock()
+		a.AccessToken = sess.JobToken // AccessToken 滚动为当前 jobToken
+		a.RefreshToken = sess.RefreshToken
+		a.ExpiresAt = sess.ExpiresAt.Unix()
+		a.Unlock()
+		_ = a.SaveAtomic() // 落盘失败不阻断本次（下次冷交换）
+	})
+	// 单飞完成后：刷新成功则 NeedsRefresh 已失效；失败/无 refresh_token 时
+	// 仍为真——调用方据此区分「已续期」与「仍需按 session dead 处理」。
+	return nil
 }

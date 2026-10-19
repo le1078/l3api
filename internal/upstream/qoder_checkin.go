@@ -192,23 +192,17 @@ func eqFoldASCII(s, want string) bool {
 // 注：成功与「已领」都走 ErrCheckinInfo——它是「信息性结果」而非错误，调度器
 // 据此打 info 日志且不触发账号冷却，语义与 codebuddy 的"今天已签到"对齐。
 func (c *Client) QoderDailyCheckin(a *auth.Auth) error {
-	ctx := context.Background()
 
 	// jobToken 滚动刷新（AccessToken 即当前 jobToken）。
+	// 单飞（2026-10-20）：与 chat/modelsync/RefreshIfNeeded 共用同一单飞组。
 	if a.NeedsRefresh(qoderRefreshSkew) {
 		if a.RefreshToken == "" {
 			return &Error{Kind: ErrSessionDead, Status: 401, Msg: "qoder refresh_token missing"}
 		}
-		sess, err := c.qoderRefreshJobToken(ctx, a.RefreshToken)
-		if err != nil {
-			return err
+		_ = c.qoderRefreshSingleflight(a)
+		if a.NeedsRefresh(qoderRefreshSkew) {
+			return &Error{Kind: ErrSessionDead, Status: 401, Msg: "qoder token refresh failed"}
 		}
-		a.Lock()
-		a.AccessToken = sess.JobToken
-		a.RefreshToken = sess.RefreshToken
-		a.ExpiresAt = sess.ExpiresAt.Unix()
-		a.Unlock()
-		_ = a.SaveAtomic() // 落盘失败不阻断本次（下次冷交换）
 	}
 	if a.UID == "" || a.AccessToken == "" {
 		return &Error{Kind: ErrSessionDead, Status: 401, Msg: "qoder auth incomplete (uid/jobToken missing)"}

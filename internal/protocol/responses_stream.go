@@ -24,6 +24,9 @@ type responsesStreamWriter struct {
 	w       http.ResponseWriter
 	flusher http.Flusher
 
+	// buf 帧组装复用缓冲（2026-10-20：消掉每帧 3 次分配）。
+	buf []byte
+
 	seq           int  // sequence_number 单调递增
 	created       bool // response.created 已发
 	respID        string
@@ -96,6 +99,9 @@ func (sw *responsesStreamWriter) nextSeq() int {
 }
 
 // writeEvent 写一帧 Responses SSE（data: {...}，type 字段必带）。
+//
+// 性能（2026-10-20）：帧组装走复用缓冲 sw.buf（append 三段后单次 Write），
+// 消掉原先 string(raw) 拷贝 + 两处字符串拼接的 3 次分配/帧。
 func (sw *responsesStreamWriter) writeEvent(eventType string, obj map[string]any) bool {
 	obj["type"] = eventType
 	obj["sequence_number"] = sw.nextSeq()
@@ -103,10 +109,13 @@ func (sw *responsesStreamWriter) writeEvent(eventType string, obj map[string]any
 	if err != nil {
 		return false
 	}
-	if _, werr := io.WriteString(sw.w, "event: "+eventType+"\ndata: "+string(raw)+"\n\n"); werr != nil {
+	frame := append(append(append(append(sw.buf[:0], "event: "...), eventType...), "\ndata: "...), raw...)
+	frame = append(frame, '\n', '\n')
+	if _, werr := sw.w.Write(frame); werr != nil {
 		sw.failed = true
 		return false
 	}
+	sw.buf = frame[:0]
 	sw.flusher.Flush()
 	return true
 }

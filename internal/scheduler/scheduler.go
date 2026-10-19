@@ -644,7 +644,13 @@ func (s *Scheduler) RunBalanceRefreshNow(brand ...string) {
 		return
 	}
 	defer unlock()
-	var wg sync.WaitGroup
+	// 并发上限（2026-10-20）：此前每个账号起一个 goroutine 同时打上游余额
+	// 接口——46 账号即 46 并发，每 5 分钟一轮。高峰时同一出口 IP 短时 46 个
+	// 请求，可能自触发 429/风控（把「查余额」变成「把账号打进冷却」）。
+	// runActivity 早有 activityAccountDelay 的先例；这里用 worker 池限并发，
+	// 46 账号分 4 路跑完（每路 ~12 个，余额接口 <1s，一轮仍 <15s）。
+	const balanceWorkers = 4
+	accounts := make([]*auth.Auth, 0, 16)
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -661,24 +667,39 @@ func (s *Scheduler) RunBalanceRefreshNow(brand ...string) {
 		if !supports(a, func(c provider.Capabilities) bool { return c.Balance }) {
 			continue
 		}
-		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
-			defer wg.Done()
-			defer recoverTask("balance:" + uid)
-			remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
-			if err != nil {
-				log.Printf("balance %s: %v", uid, err)
-				s.markSessionDeadIf(uid, a, err, "余额刷新")
-				return
-			}
-			// 只解信用冷却（CoolHard）；429/模型级冷却保留（见方法注释）。
-			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			if expiring > 0 {
-				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
-			}
-			s.notifyBalanceLow(uid, a.Brand(), a.Nickname, remain)
-		}(a, st.UID)
+		accounts = append(accounts, a)
 	}
+	var wg sync.WaitGroup
+	work := make(chan *auth.Auth)
+	for w := 0; w < balanceWorkers && w < len(accounts); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer recoverTask("balance:worker")
+			for a := range work {
+				uid := a.UID
+				func() {
+					defer recoverTask("balance:" + uid)
+					remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+					if err != nil {
+						log.Printf("balance %s: %v", uid, err)
+						s.markSessionDeadIf(uid, a, err, "余额刷新")
+						return
+					}
+					// 只解信用冷却（CoolHard）；429/模型级冷却保留（见方法注释）。
+					s.cfg.Pool.ReenableIfCredits(uid, remain, total)
+					if expiring > 0 {
+						s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
+					}
+					s.notifyBalanceLow(uid, a.Brand(), a.Nickname, remain)
+				}()
+			}
+		}()
+	}
+	for _, a := range accounts {
+		work <- a
+	}
+	close(work)
 	wg.Wait()
 }
 

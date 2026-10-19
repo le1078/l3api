@@ -140,13 +140,17 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	now := time.Now()
 	available := r.availableSet(model)
 
-	// ── Fast path: RLock 快查 ──────────────────────────────
+	// ── Fast path: RLock 快查 + 同锁内滚动 lastActive ──────────────
+	// 2026-10-20：原先快路径命中后调 touch() 再取一次**写锁**（每请求 2 次
+	// 锁往返 + 1 次 Redis 写）。改为在 RLock 内只读校验、写锁内只改
+	// lastActive 字段（不动 map 结构），并把 Redis 镜像节流到
+	// TTL/2——粘性绑定在 TTL 内不变，没必要每请求都写一次。
 	r.mu.RLock()
 	e, found := r.entries[key]
 	r.mu.RUnlock()
 	if found && !expired(e, now, r.cfg.TTL) {
 		if available[e.uid] {
-			r.touch(key, e.uid, now)
+			r.touchThrottled(key, e.uid, now)
 			return e.uid, true
 		}
 		// 绑定号已冷却/占满 → 失效，落入慢路径重分配。
@@ -196,19 +200,28 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	return uid, true
 }
 
-// touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
-// 写锁内复查（2026-09-29 修复 TOCTOU）：快路径读到的 uid 可能在锁间隙已被
-// 并发 Unbind/重绑定/GC 改动——无复查会把它覆盖回旧值并把脏绑定镜像到 Redis。
-func (r *Router) touch(key, uid string, now time.Time) {
+// touchThrottled 滚动 lastActive（写锁内复查，TOCTOU 防护源自 2026-09-29
+// 的 touch 修复：快路径读到的 uid 可能在锁间隙已被并发 Unbind/重绑定/GC
+// 改动——无复查会把它覆盖回旧值并把脏绑定镜像到 Redis），但 Redis 镜像节流：
+// 距上次镜像超过 TTL/2 才写一次（2026-10-20）。
+//
+// 为什么可以节流：SetBind 到 Redis 的目的是「重启后恢复粘性」，Redis 侧该
+// key 的 TTL 由 Store.SetBind 自己续（写入即刷新 TTL）。本地 lastActive 才是
+// GC 过期判据——内存里每次请求都准，Redis 里只要在 TTL/2 内有最后一次写入，
+// 重启恢复的绑定就不会被本地 GC 提前判死。省掉的是 RPS 级的 Redis 写。
+func (r *Router) touchThrottled(key, uid string, now time.Time) {
 	r.mu.Lock()
 	cur, ok := r.entries[key]
 	if !ok || cur.uid != uid || expired(cur, now, r.cfg.TTL) {
 		r.mu.Unlock()
 		return // 已变：放弃本次滚动（下一跳会按现状重新判定）
 	}
+	needMirror := now.Sub(cur.lastActive) > r.cfg.TTL/2
 	r.entries[key] = entry{uid: uid, lastActive: now}
 	r.mu.Unlock()
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	if needMirror {
+		r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	}
 }
 
 // Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
@@ -345,6 +358,20 @@ func ExtractKey(body []byte) string {
 // derivedKeyPrefix 派生键前缀，与显式会话 id 的命名空间隔离：
 // 即便客户端恰好传了形如 "d-<hex>" 的显式 id 也不至于与派生键混淆（显式 id 优先返回）。
 const derivedKeyPrefix = "d-"
+
+// DeriveSessionKey 按 system/首条 user 文本派生稳定会话键（deriveKey 的文本入参版）。
+//
+// 导出理由：server 包 2026-10-20 的 bodyFacts 单次解析合并了 ExtractKey/deriveKey
+// （同一 body 原先被解析 7 次），派生算法仍须单一来源——直接复用本函数，
+// 避免两份 sha256 口径漂移导致粘性键静默变化。
+// firstUserText 为空时返回 ""（无用户消息无从归属会话）。
+func DeriveSessionKey(systemText, firstUserText string) string {
+	if firstUserText == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+}
 
 // deriveKey 从消息内容派生稳定会话键：SHA-256(system 文本 + 首条 user 文本) 前 16 字节。
 //

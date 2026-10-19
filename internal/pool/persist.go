@@ -33,7 +33,7 @@ type StoreSnapshotter interface {
 
 // defaultIdle* 闲置补偿默认参数（claude-api selectWeightedRandom 参考口径）。
 func (p *Pool) RestoreFromSnapshot() {
-	store := p.store
+	store := p.storeRef() // 持 RLock 读（2026-10-20：原裸读 p.store 与 SetStore 竞态）
 	if store == nil || p.stateFp == "" {
 		return
 	}
@@ -55,7 +55,13 @@ func (p *Pool) RestoreFromSnapshot() {
 	// 此前该分支被漏掉：本地缺失会走到末尾「本地较新」的错误分支，合法
 	// Redis 快照被静默忽略，全部账号冷却/熔断/禁用状态失忆。
 	if localErr != nil || !localInfo.ModTime().After(snap.SavedAt) {
-		// 快照不早于本地（或本地缺失）→ 采用快照。
+		// 采用快照 = 全量覆盖本地内存态（applySnapshotLocked 直接重建 byUID）。
+		// 先备份本地 state.json 为 .bak（2026-10-20）：多机时钟偏移会让
+		// 「较旧本地」被「较新但内容更旧」的 Redis 快照覆盖（SavedAt 由写侧
+		// time.Now() 打，跨机不可比），没有副本时这次覆盖不可逆。
+		if localErr == nil {
+			backupStateBeforeRestore(p.stateFp)
+		}
 		p.mu.Lock()
 		p.applySnapshotLocked(snap)
 		p.mu.Unlock()
@@ -65,6 +71,19 @@ func (p *Pool) RestoreFromSnapshot() {
 	}
 	log.Printf("pool: 恢复来源=本地 state.json（较新于 Redis 快照 %s）", snap.SavedAt.Format(time.RFC3339))
 	_ = localErr
+}
+
+// backupStateBeforeRestore 采用 Redis 快照前把本地 state.json 复制为
+// <path>.bak（同名覆盖：只保留最近一次快照恢复前的副本，不滚历史）。
+// 失败仅打日志不阻断——恢复本身优先（.bak 只是保险）。
+func backupStateBeforeRestore(path string) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return // 读不到就没有备份的意义（上层已判 localErr == nil，这里是双保险）
+	}
+	if err := os.WriteFile(path+".bak", raw, 0o600); err != nil {
+		log.Printf("pool: 快照恢复前备份 %s.bak 失败: %v（继续采用快照）", path, err)
+	}
 }
 
 // Acquire 为账号占一个在途名额；false 表示该账号已达上限（或不存在）。
@@ -261,12 +280,23 @@ func (p *Pool) saveStateFile(fp string, sf stateFile) {
 	}
 	p.mu.Unlock()
 	// 同步镜像一份快照到 Redis（fire-and-forget），与本地 state.json 并存作恢复备份。
-	if p.store != nil {
+	// store 经 storeRef 持 RLock 读（2026-10-20：原裸读与 SetStore 竞态）。
+	// 注意此处已在锁外（saveLocked 末尾），不能再取 p.mu——RLock 不冲突。
+	if store := p.storeRef(); store != nil {
 		snapRaw, err := json.Marshal(snapshot{stateFile: sf, SavedAt: time.Now()})
 		if err == nil {
-			p.store.SaveState(snapRaw)
+			store.SaveState(snapRaw)
 		}
 	}
+}
+
+// PersistFails 返回当前连续落盘失败次数（0 = 健康）。供 /status 与 /metrics
+// 暴露（2026-10-20）：此前连续失败只打节流日志，磁盘满/权限丢失时面板显示
+// 一切正常——运维看不出 state.json 已经写不进去（重启即丢全部冷却/禁用状态）。
+func (p *Pool) PersistFails() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.persistFails
 }
 
 // notePersistFail 记录一次本地 state.json 落盘失败，并按节流规则决定是否打日志：

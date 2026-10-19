@@ -34,14 +34,25 @@ type metricsSet struct {
 	requests *metrics.CounterVec
 	attempts *metrics.CounterVec
 	duration *metrics.HistogramVec
+	// upstreamErrs 上游错误分类计数（2026-10-20 补）：{realm,kind,status}——
+	// attempts 的 outcome 只有 success/fail，429/5xx/超时/内容拦截全混在
+	// fail 里，看不出失败构成。kind 用 upstream.ErrKind 的稳定字符串。
+	upstreamErrs *metrics.CounterVec
+	// pickFails 选号失败计数（2026-10-20 补）：{realm,reason}——503
+	// no_healthy_account 此前只有一条通知（未配 notify 即全静默），看不到
+	// 候选账号各自因何被排除。reason 是枚举（cooling/breaker/degrade/
+	// in_flight_full/free_exhaust/model_cooldown/credit_floor/none）。
+	pickFails *metrics.CounterVec
 }
 
 func newMetricsSet() *metricsSet {
 	return &metricsSet{
-		started:  time.Now(),
-		requests: metrics.NewCounterVec("l3api_chat_requests_total", "Chat requests delivered by protocol endpoint."),
-		attempts: metrics.NewCounterVec("l3api_chat_attempts_total", "Upstream account attempts (including rotation retries)."),
-		duration: metrics.NewHistogramVec("l3api_chat_request_duration_seconds", "End-to-end request duration.", nil),
+		started:      time.Now(),
+		requests:     metrics.NewCounterVec("l3api_chat_requests_total", "Chat requests delivered by protocol endpoint."),
+		attempts:     metrics.NewCounterVec("l3api_chat_attempts_total", "Upstream account attempts (including rotation retries)."),
+		duration:     metrics.NewHistogramVec("l3api_chat_request_duration_seconds", "End-to-end request duration.", nil),
+		upstreamErrs: metrics.NewCounterVec("l3api_chat_upstream_errors_total", "Upstream error responses by classified kind."),
+		pickFails:    metrics.NewCounterVec("l3api_chat_pick_failures_total", "Account pick failures by exclusion reason."),
 	}
 }
 
@@ -74,6 +85,19 @@ func statusLabel(status int) string {
 		return "unset"
 	}
 	return strconv.Itoa(status)
+}
+
+// realmLabelForMetrics realm 归一到有限 label 空间（防基数爆炸）：
+// cn/global/qoder/trae 原样，空 → "cn"（裸名缺省域），其余归一 "other"。
+func realmLabelForMetrics(realm string) string {
+	switch realm {
+	case "", "cn", "global", "qoder", "trae":
+		if realm == "" {
+			return "cn"
+		}
+		return realm
+	}
+	return "other"
 }
 
 // metricsHandler GET /metrics：池仪表按 scrape 实时计算（Pool.List 一次遍历），
@@ -139,7 +163,7 @@ func (h *Handler) metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_, _ = w.Write([]byte((&metrics.WriteTo{
-		Counters:    []*metrics.CounterVec{m.requests, m.attempts},
+		Counters:    []*metrics.CounterVec{m.requests, m.attempts, m.upstreamErrs, m.pickFails},
 		Histograms:  []*metrics.HistogramVec{m.duration},
 		ExtraHeader: extra,
 	}).Render()))

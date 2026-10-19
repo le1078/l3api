@@ -29,15 +29,42 @@ package upstream
 
 import (
 	"sort"
+	"sync"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// promoTZ 促销时段时区。上游 schedule.timezone 写 "Asia/Shanghai"；容器可能没有
-// /usr/share/zoneinfo（LoadLocation 会失败），故固定回落 UTC+8 —— 与 scheduler 的
-// scheduleTZ 同口径，不引入 tzdata 依赖（不 import time/tzdata 膨胀二进制）。
+// promoTZ 促销时段时区的兜底值。上游 schedule.timezone 实测写 "Asia/Shanghai"
+//（与 UTC+8 等价）；容器可能没有 /usr/share/zoneinfo（LoadLocation 会失败），
+// 故固定回落 UTC+8——与 scheduler 的 scheduleTZ 同口径。
+// 2026-10-20：import _ "time/tzdata" 已由 main 引入（二进制 +450KB），容器内
+// LoadLocation("Asia/Shanghai") 恒成功；本兜底仍保留（防 tzdata 被裁）。
 var promoTZ = time.FixedZone("CST", 8*3600)
+
+// promoLocCache 时区名 → *time.Location 缓存（time.LoadLocation 每次解析
+// zoneinfo 文件，热路径每帧都调会放大开销）。有界：上游只会发有限个时区名。
+var promoLocCache sync.Map
+
+// promoLoc 解析促销时区：tz 空/解析失败 → promoTZ（UTC+8 兜底，与旧行为一致）。
+// 成功解析的结果按名缓存（sync.Map，无锁读）。
+func promoLoc(tz string) *time.Location {
+	if tz == "" {
+		return promoTZ
+	}
+	if v, ok := promoLocCache.Load(tz); ok {
+		return v.(*time.Location)
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		// 未知时区名/容器无 zoneinfo：回落兜底（旧口径）。不缓存失败结果——
+		// tzdata 可能是启动后才就绪的（main 的 import 保证就绪，但测试环境
+		// 可能没有），下次重试仍有机会。
+		return promoTZ
+	}
+	promoLocCache.Store(tz, loc)
+	return loc
+}
 
 // ModelPromotion 单个模型的生效营销/折扣活动（展示用，不参与选号/计费）。
 //
@@ -63,6 +90,12 @@ type ModelPromotion struct {
 	Factor float64 // 折扣因子（0 = 免费，0.5 = 5折）；无 discount 时为 0 且 Credit 为空
 	Credit string  // 折后倍率原文（"0x" / "0.50x"）；空 = 该条未声明折扣（只挂徽章）
 	Text   string  // hover.textZh 上游原文说明（结构化表达不了的细节在此）
+
+	// TZ 上游 schedule.timezone 原文（如 "Asia/Shanghai"）；空 = 未声明，
+	// 用 promoTZ（UTC+8 固定）。2026-10-20 补：此前该字段被丢弃，上游一旦
+	// 下发非 +8 时区，日窗判定整体偏移。LoadLocation 失败（容器无 zoneinfo）
+	// 时回落 promoTZ——行为与旧版一致，不会更坏。
+	TZ string
 }
 
 // WindowText 人读时段串；无有效时段（全天窗口 00:00–23:59）返回空串——
@@ -119,7 +152,8 @@ func (p ModelPromotion) inDailyWindow(now time.Time) bool {
 	if !sok || !eok {
 		return true
 	}
-	m := now.In(promoTZ).Hour()*60 + now.In(promoTZ).Minute()
+	loc := promoLoc(p.TZ)
+	m := now.In(loc).Hour()*60 + now.In(loc).Minute()
 	if sm <= em {
 		return m >= sm && m < em
 	}
@@ -149,12 +183,13 @@ func (p ModelPromotion) IsFree() bool {
 //
 // 返回值总在 now 之后（调用方据此计算 until，零值/过去值无意义）。
 func (p ModelPromotion) NextReset(now time.Time) time.Time {
-	t := now.In(promoTZ)
+	loc := promoLoc(p.TZ)
+	t := now.In(loc)
 	if sm, sok := parseClock(p.Start); sok {
 		if em, eok := parseClock(p.End); eok {
 			// 日窗：找 now 所在窗口的 End。
 			// 构造「今天 Start」「今天 End」两个候选墙钟，按跨午夜语义推。
-			dayStart := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, promoTZ)
+			dayStart := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
 			startToday := dayStart.Add(time.Duration(sm) * time.Minute)
 			endToday := dayStart.Add(time.Duration(em) * time.Minute)
 			if sm <= em {
@@ -179,18 +214,21 @@ func (p ModelPromotion) NextReset(now time.Time) time.Time {
 		}
 	}
 	// 全天型：次日 00:00（promoTZ）。
-	dayStart := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, promoTZ)
+	dayStart := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
 	return dayStart.Add(24 * time.Hour)
 }
 
 // inDateRange 日期区间判定（半开区间 [from, until)）。无区间 → 恒真。
+// 时区用 promoLoc(p.TZ)（2026-10-20 与日窗同口径）：ValidFrom/Until 原文带
+// 偏移（如 +08:00），parsePromoTime 已按各自偏移解析成绝对时刻，这里的 TZ
+// 只影响「now 归算到哪个本地日」的边界比较。
 func (p ModelPromotion) inDateRange(now time.Time) bool {
 	from, fromOK := parsePromoTime(p.ValidFrom)
 	until, untilOK := parsePromoTime(p.ValidUntil)
 	if !fromOK && !untilOK {
 		return true
 	}
-	t := now.In(promoTZ)
+	t := now.In(promoLoc(p.TZ))
 	if fromOK && t.Before(from) {
 		return false
 	}
@@ -237,6 +275,7 @@ func (e modelPromotionEntry) toPromotion() ModelPromotion {
 		Label: e.Badge.Label,
 		Kind:  e.Kind,
 		Text:  e.Hover.TextZh,
+		TZ:    e.Schedule.Timezone,
 	}
 	if len(e.Schedule.Daily) > 0 {
 		p.Start = e.Schedule.Daily[0].Start

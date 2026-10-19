@@ -746,15 +746,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     box-shadow: 0 1px 2px rgba(0,0,0,.18);
   }
   .uschart-hd .segmented .seg[hidden] { display: none; }
-  /* 二级「拆分」：描边胶囊，选中态只着色不填充，跟一级的实心段区分开 */
-  .uschart-hd #usModes .seg {
-    border: 1px solid var(--line); border-radius: 999px; padding: 4px 11px;
-    background: var(--surface-2);
-  }
-  .uschart-hd #usModes .seg:hover:not(.on) { color: var(--ink); border-color: var(--ink-3); background: var(--raise); }
+  /* 二级「拆分」（v1.16.21）：iOS 风格分段控件——整条灰底轨道 + 选中段白色浮起，
+     四项连成一体，不再是四个散落的描边胶囊；与一级的 accent 实心段也区分开 */
+  .uschart-hd #usModes { background: var(--surface-2); }
+  .uschart-hd #usModes .seg { padding: 4px 12px; color: var(--ink-2); }
+  .uschart-hd #usModes .seg:hover:not(.on) { color: var(--ink); background: var(--raise); }
   .uschart-hd #usModes .seg.on {
-    background: var(--accent-soft); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-    font-weight: 600;
+    background: var(--surface); color: var(--ink); font-weight: 600;
+    box-shadow: 0 1px 2.5px rgba(0,0,0,.14), 0 0 0 .5px var(--line-soft);
   }
   /* 窄屏：标签收起、两组各占一行，靠段间距区分（不再一行挤到底） */
   @media (max-width: 1100px) {
@@ -1564,6 +1563,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div id="toasts"></div>
 
 <script src="echarts.min.js"></script>
-<script src="app.js?v=1.16.20"></script>
+<script src="app.js?v=1.17.0"></script>
 </body>
 </html>

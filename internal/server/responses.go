@@ -41,7 +41,10 @@ func (h *Handler) responsesAPI(w http.ResponseWriter, r *http.Request) {
 	if !h.enforceModelAllowlist(w, r, cleanModel) {
 		return
 	}
-	h.doChat(w, r, chatBody, req.Stream, cleanModel, forcePaid, newResponsesSink(cleanModel))
+	// bodyFacts 单次解析（2026-10-20）：Responses 请求体已转成 OpenAI 形态，
+	// 与 chatCompletions 同路径解析；marshaled 的 chatBody 恒合法 JSON。
+	facts := bodyFacts(chatBody)
+	h.doChat(w, r, chatBody, req.Stream, cleanModel, forcePaid, newResponsesSink(cleanModel), facts)
 }
 
 // newResponsesSink Responses 协议输出（流式翻译经 stats 观测器，记账同源）。

@@ -12,9 +12,36 @@ import (
 	"time"
 )
 
+// writeSSEFrame 以 "data: <payload>\n\n" 形式写出并 flush。
+//
+// 性能（2026-10-20）：原写法 `io.WriteString(w, "data: "+payload+"\n\n")`
+// 每帧 3 次分配——string(payload) 拷贝一次、两处字符串拼接各一次。
+// 本函数把帧头/载荷/帧尾 append 进同一个缓冲后单次 Write，1 次分配；
+// 且避免 payload 经 []byte→string 的额外拷贝（直接用底层字节）。
+// buf 由调用方持有复用（见 sseWriteBuf）。
+// fl 为 nil 表示不 flush（无 http.Flusher 的测试 writer）。
+func writeSSEFrame(w io.Writer, fl http.Flusher, buf []byte, payload []byte) error {
+	frame := append(append(append(buf[:0], "data: "...), payload...), '\n', '\n')
+	_, err := w.Write(frame)
+	if fl != nil {
+		fl.Flush()
+	}
+	return err
+}
+
+// MaxAggregateContentLen Aggregate 聚合正文的累计上界（2026-10-20）。
+//
+// 非流式路径把整条流的 delta.content 无界累加进 strings.Builder——上游
+// 故障（无限吐内容帧）时单请求可吃数百 MB。32MB 远超任何合法回答
+// （128K 上下文 × 4 字节/token ≈ 0.5MB 上限），超限按 finish_reason=length
+// 截断收尾（语义与 truncation.go 的 max_tokens 截断一致，客户端可感知）。
+const MaxAggregateContentLen = 32 << 20
+
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
+// 单行超 MaxSSELineLen 或正文累计超 MaxAggregateContentLen 时断流报错
+// （2026-10-20：故障上游防护）。
 func Aggregate(r io.Reader) (map[string]any, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
@@ -29,10 +56,17 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		validEvents   int
 		toolCalls     = map[int]map[string]any{}
 		toolOrder     []int
+		truncated     bool // 正文累计超限：按 length 截断收尾
 	)
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		// 单行上界（2026-10-20）：故障上游吐无换行超长行时 ReadString 会无界
+		// 扩容吃内存——超限立即断流（客户端走 502 upstream_parse，账号走
+		// NoteFailures 连败兜底），而不是把容器拖进 OOM。
+		if err := CheckSSELineLen(line, 0); err != nil {
 			return nil, err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -79,7 +113,15 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 									role = r2
 								}
 								if txt, ok := delta["content"].(string); ok {
-									content.WriteString(txt)
+									if !truncated {
+										// 正文累计上界（2026-10-20）：超限后丢弃后续
+										// 内容帧（不再累加），读完剩余帧后按 length 收尾。
+										if content.Len()+len(txt) > MaxAggregateContentLen {
+											truncated = true
+										} else {
+											content.WriteString(txt)
+										}
+									}
 									gotAnyContent = true
 								}
 								if rc, ok := delta["reasoning_content"].(string); ok {
@@ -124,6 +166,11 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		// 上游返回 200 但没有任何有效数据事件（空流/只有 [DONE]/只有注释行）：
 		// 不再合成空 content 的假成功响应，直接报错，由 handler 映射为 502 upstream_parse。
 		return nil, fmt.Errorf("upstream stream contained no valid data events")
+	}
+	if truncated {
+		// 正文超 MaxAggregateContentLen：按 max_tokens 截断的同口径收尾，
+		// 客户端能感知「回答被截断」而不是收到一条假完整回答。
+		finishReason = "length"
 	}
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -391,6 +438,10 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
 
+	// writeBuf 本流的帧组装缓冲（2026-10-20：消除每帧 3 次字符串拼接）。
+	// 预分配 4KB——普通 delta 帧 1~5KB，多数帧零增长。
+	writeBuf := make([]byte, 0, 4096)
+
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen := map[int]bool{}
@@ -417,17 +468,12 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	// 故经此写出。gateway_hint：上游 error 帧透出前按 hintFn 附加
 	// error.gateway_hint 字段（error 对象上加一个键，message/code/requestId 等
 	// 原文不动；hintFn 为 nil / 空串 / 非 JSON 帧 → 原样写出，零改写）。
+	// 帧缓冲 writeBuf 由本流持有复用（2026-10-20：每帧 3 次字符串拼接 → 1 次 Write）。
 	writeRaw := func(payload string) error {
 		if hint := frameGatewayHint(hintFn, payload); hint != "" {
 			payload = attachHintToErrorFrame(payload, hint)
 		}
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
-			return werr
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
+		return writeSSEFrame(w, fl, writeBuf, []byte(payload))
 	}
 
 	// repairFrame 在透传前跑标记修复，并把一帧展开成「可能多帧」：正文帧（标记被
@@ -497,11 +543,8 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		var obj map[string]any
 		if json.Unmarshal([]byte(payload), &obj) != nil {
 			// 非 JSON 帧：原样降级写出，不计数（与修复前一致）。
-			if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
+			if werr := writeSSEFrame(w, fl, writeBuf, []byte(payload)); werr != nil {
 				return 0, werr
-			}
-			if fl != nil {
-				fl.Flush()
 			}
 			return 0, nil
 		}
@@ -559,11 +602,8 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 			if err != nil {
 				out = []byte(payload)
 			}
-			if _, werr := io.WriteString(w, "data: "+string(out)+"\n\n"); werr != nil {
+			if werr := writeSSEFrame(w, fl, writeBuf, out); werr != nil {
 				return 0, werr
-			}
-			if fl != nil {
-				fl.Flush()
 			}
 		}
 		return 1, nil
@@ -574,6 +614,11 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 readLoop:
 	for {
 		line, err := br.ReadString('\n')
+		// 单行上界（2026-10-20）：故障上游的无换行超长行会让 ReadString 无界
+		// 扩容——超限断流，客户端走既有 502 upstream_parse，账号走 NoteFailures。
+		if lerr := CheckSSELineLen(line, 0); lerr != nil {
+			return lerr
+		}
 		trimmed := strings.TrimRight(line, "\r\n")
 		switch {
 		case strings.HasPrefix(trimmed, "data: [DONE]"):
@@ -617,21 +662,15 @@ readLoop:
 				}},
 			}
 			raw, _ := json.Marshal(normalizeFrame(tailObj))
-			if _, werr := io.WriteString(w, "data: "+string(raw)+"\n\n"); werr != nil {
+			if werr := writeSSEFrame(w, fl, writeBuf, raw); werr != nil {
 				return werr
-			}
-			if fl != nil {
-				fl.Flush()
 			}
 			validFrames++
 		}
 		if synthIdx > 0 && !toolFinishSent {
 			raw, _ := json.Marshal(normalizeFrame(finishOnlyFrame(map[string]any{}, "tool_calls")))
-			if _, werr := io.WriteString(w, "data: "+string(raw)+"\n\n"); werr != nil {
+			if werr := writeSSEFrame(w, fl, writeBuf, raw); werr != nil {
 				return werr
-			}
-			if fl != nil {
-				fl.Flush()
 			}
 		}
 	}
@@ -643,7 +682,7 @@ readLoop:
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+	if err := writeSSEFrame(w, fl, writeBuf, []byte("[DONE]")); err != nil {
 		return err
 	}
 	if fl != nil {

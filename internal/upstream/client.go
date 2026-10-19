@@ -583,6 +583,12 @@ type Client struct {
 	HeaderTimeout time.Duration
 	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
 	IdleTimeout time.Duration
+	// StreamTotalTimeout 聊天 SSE 流总时长硬顶（2026-10-20）；<=0 = 不设。
+	// 与 IdleTimeout 的分工：idle 管「静默多久」，total 管「总共多久」——
+	// 上游每 N 分钟吐 1 字节 keepalive 时 idle 永不触发，流会无限期占用
+	// 账号在途名额（max_in_flight=8，几条这样的流就把池子打满）。到点即
+	// cancel 断流（与空闲监控共用 cancel 与后台 goroutine）。
+	StreamTotalTimeout time.Duration
 
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	// 按 realm 分层桶（cn/global）：同模型名跨域探测的 effort 集合可能不同，
@@ -951,7 +957,10 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		a.Domain = tok.Domain
 	}
 	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
-	if tok.ExpiresIn > 0 {
+	// ExpiresIn 下限保护（2026-10-20）：上游返回异常小值（如 1s）会让账号
+	// 立刻再次临期 → 每个请求都触发刷新（刷新风暴）。小于 60s 视为异常
+	// 丢弃、保留旧过期时间——与「缺 expiresIn」同口径。
+	if tok.ExpiresIn >= 60 {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
 	return nil
@@ -1057,7 +1066,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
 		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
 		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
-		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
+		return monitorBody(resp.Body, c.IdleTimeout, c.StreamTotalTimeout, cancel), resp.StatusCode, nil, nil
 	}
 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }
