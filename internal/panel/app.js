@@ -2254,7 +2254,8 @@ function usBuildGrid(named, t0, t1) {
   return { data: out, t0, t1, withHour };
 }
 
-/* usPeakIdx 找一组数据里的峰值下标——只给单线（全部消耗）的峰值点画实心圆点。
+/* usPeakIdx 找一组数据里的峰值下标——只给峰值点画实心圆点，其余下标返回 0 不渲染。
+   单线（全部消耗）与多线（按模型/按品牌/按 Key）共用：每个系列只有一个点。
    注意下标必须对完整数组（含 null）取：symbolSize 回调的 dataIndex 就是这个
    数组的下标，对过滤后的数组取会错位。全部为 0 时返回 -1（不画）。 */
 function usPeakIdx(data) {
@@ -2348,19 +2349,16 @@ function usFigSeries(named, grid, isMulti) {
       base.symbolSize = (val, pp) => pp.dataIndex === usPeakIdx(data) ? 7 : 0;
       base.areaStyle = { color, opacity: 0.08 };
     } else {
-      // 多线：默认不画点（否则 11 条线全是点，噪声盖过趋势）。但**非零点很少时
-      // 必须画点**——积分模式常常整窗只有一两小时有扣费，线条几乎为 0 且没有
-      // 点，画面上什么都看不到（实测线上：152M token 只扣 2.77 分，全在最后一小时）。
-      const nonzero = data.filter(d => d[1] > 0).length;
-      if (nonzero > 0 && nonzero <= 24) {
-        base.showSymbol = true;
-        base.symbolSize = 5;
-        base.symbolBorderWidth = 0;
-      } else {
-        base.showSymbol = false;
-      }
-      // 不裁剪到绘图区：数据点落在窗口两端（最常见是「刚刚这一小时」）时，
-      // 实心圆点会被 grid 右边界切掉一半，看着像没有线（v1.16.11 实测）。
+      // 多线：**每条线只画一个点——它自己的峰值点**（v1.16.19 用户诉求：
+      // 「点太多了，只在峰值上显示一次，每个曲线只有一个峰值点」）。
+      // 早期实现是按「非零点 ≤24 就给每个非零点画点」，稀疏积分曲线因此满是小点。
+      // symbolSize 回调对非峰值返回 0，ECharts 就不渲染该点。
+      // 注意：非零峰值不存在（整条 0 线）时返回 -1，全画 0 = 无点，符合预期。
+      const peak = usPeakIdx(data);
+      base.symbolSize = (val, pp) => pp.dataIndex === peak ? 6 : 0;
+      base.symbolBorderWidth = 0;
+      // 不裁剪到绘图区：峰值点落在窗口两端（最常见是「刚刚这一小时」）时，
+      // 实心圆点会被 grid 边界切掉一半，看着像没有线（v1.16.11 实测）。
       base.clip = false;
     }
     return base;
@@ -2586,12 +2584,13 @@ function renderUsageChart(snap) {
     let note = '';
     if (isCredit) {
       note = isMulti
-        ? '共 ' + named.length + ' 条系列（按品牌的实测扣费积分，点击图例可开关）。'
-        : '曲线为该时段实测扣费积分之和（上游 usage.credit）。';
+        ? '共 ' + named.length + ' 条系列（按品牌的实测扣费积分，点击图例可开关）；每条线只标出它自己的峰值点。'
+        : '曲线为该时段实测扣费积分之和（上游 usage.credit），点即峰值。';
     } else if (isMulti) {
       const other = named.find(s => s.name === US_OTHER_NAME);
       note = '共 ' + named.length + ' 条系列（每系列一色，点击图例可开关）' +
-             (other ? '；小量维度已并入「其他」' : '') + '。';
+             (other ? '；小量维度已并入「其他」' : '') +
+             '；每条线只标出它自己的峰值点。';
     }
     $('usFigNote').textContent = note;
   }
@@ -2680,13 +2679,14 @@ async function loadUsage() {
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
 if ($('usWindow')) $('usWindow').onchange = loadUsage;
 
-/* 图表模式切换（全部消耗 / 按模型 / 按 Key）：只重画、不重新拉接口——
-   数据已在 usLastUsage 里，切换即时生效。 */
+/* 图表模式切换（全部消耗 / 按模型 / 按品牌 / 按 Key）：只重画、不重新拉接口——
+   数据已在 usLastUsage 里，切换即时生效。选中态类是 .seg（v1.16.18 起图表头
+   两级筛选不再用 .chip，见 index.html .uschart-hd 段）。 */
 if ($('usModes')) $('usModes').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-mode]');
   if (!b) return;
   usFigState.mode = b.dataset.mode;
-  $('usModes').querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c === b));
+  $('usModes').querySelectorAll('.seg').forEach(c => c.classList.toggle('on', c === b));
   if (usLastUsage) renderUsageChart(usLastUsage);
 });
 
@@ -2699,7 +2699,7 @@ if ($('usMetric')) $('usMetric').addEventListener('click', ev => {
   const metric = b.dataset.metric;
   if (usFigState.metric === metric) return;
   usFigState.metric = metric;
-  $('usMetric').querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c === b));
+  $('usMetric').querySelectorAll('.seg').forEach(c => c.classList.toggle('on', c === b));
 
   // 积分指标只保留「全部消耗」与「按品牌」两个模式：按模型/按 Key 的积分
   // 明细同样有数据，但用户这里的诉求是品牌维度，先把噪声收掉。

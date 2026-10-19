@@ -714,6 +714,55 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .uschart-hd { display: flex; align-items: center; gap: 10px; padding: 9px 12px;
     border-bottom: 1px solid var(--line-soft); font-size: 12px; }
   .uschart-hd .lb { color: var(--ink-2); font-weight: 550; }
+  /* ── 图表头两级筛选（v1.16.18）──────────────────────────────────
+     旧版两排都是 .xs.chip（同样的描边小胶囊），指标与拆分长得一模一样，
+     用户分不清谁是一级谁是二级。现在：
+       · 一级「指标」= segmented（外框分段控件，选中=实心 accent 白字）；
+       · 二级「拆分」= .seg 描边胶囊，选中=accent 文字 + accent-soft 底。
+     两种选中态在形状/填充上都不同，一眼能分出层级；两组之间用小标签
+     （指标／拆分）+ 竖分隔条隔开。 */
+  .uschart-hd .us-seg-lab {
+    color: var(--ink-3); font-size: 11px; letter-spacing: .04em; flex: none;
+    text-transform: none; padding-right: 1px;
+  }
+  .uschart-hd .us-seg-sep {
+    width: 1px; align-self: stretch; margin: 1px 4px; flex: none;
+    background: var(--line-soft);
+  }
+  .uschart-hd .segmented {
+    display: inline-flex; align-items: center; gap: 2px; flex: none;
+    padding: 2px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--surface-2);
+  }
+  .uschart-hd .segmented .seg {
+    border: 1px solid transparent; border-radius: 6px; background: none;
+    color: var(--ink-2); font: 550 12px var(--sans); line-height: 1;
+    padding: 5px 11px; cursor: pointer; white-space: nowrap;
+    transition: color .12s, background .12s;
+  }
+  .uschart-hd .segmented .seg:hover:not(.on) { color: var(--ink); background: var(--raise); }
+  .uschart-hd .segmented .seg.on {
+    background: var(--accent); color: var(--accent-ink);
+    box-shadow: 0 1px 2px rgba(0,0,0,.18);
+  }
+  .uschart-hd .segmented .seg[hidden] { display: none; }
+  /* 二级「拆分」：描边胶囊，选中态只着色不填充，跟一级的实心段区分开 */
+  .uschart-hd #usModes .seg {
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 11px;
+    background: var(--surface-2);
+  }
+  .uschart-hd #usModes .seg:hover:not(.on) { color: var(--ink); border-color: var(--ink-3); background: var(--raise); }
+  .uschart-hd #usModes .seg.on {
+    background: var(--accent-soft); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+    font-weight: 600;
+  }
+  /* 窄屏：标签收起、两组各占一行，靠段间距区分（不再一行挤到底） */
+  @media (max-width: 1100px) {
+    .uschart-hd { flex-wrap: wrap; row-gap: 7px; }
+    .uschart-hd .us-seg-lab { display: none; }
+    .uschart-hd .us-seg-sep { display: none; }
+    .uschart-hd #usMetric, .uschart-hd #usModes { margin-left: 6px; }
+  }
   .uschart-hd .legend { color: var(--ink-3); font-size: 11.5px; display: flex; align-items: center; gap: 5px; }
   .uschart-hd .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-left: 8px; }
   .uschart-hd .sw-p { background: var(--accent); }
@@ -979,16 +1028,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="uschart-hd">
               <span class="lb" id="usChartLabel">Token 时序 · 全部消耗</span>
               <span class="grow"></span>
-          <span class="chips" id="usMetric">
-            <button class="xs chip on" data-metric="token">Token</button>
-            <button class="xs chip" data-metric="credit">积分消耗</button>
-          </span>
-          <span class="chips" id="usModes">
-            <button class="xs chip on" data-mode="total">全部消耗</button>
-            <button class="xs chip" data-mode="model">按模型</button>
-            <button class="xs chip" data-mode="brand">按品牌</button>
-            <button class="xs chip" data-mode="key">按 Key</button>
-          </span>
+              <!-- 两级筛选（v1.16.18）：第一级=指标（大类），第二级=拆分维度（次级）。
+                   视觉上用 segmented（实心选中）+ seg（描边未选）区分，二级之间加
+                   分隔标签，不再让两组长得一样混在一起。 -->
+              <span class="us-seg-lab">指标</span>
+              <span class="segmented" id="usMetric" role="group" aria-label="指标">
+                <button class="seg on" data-metric="token">Token</button>
+                <button class="seg" data-metric="credit">积分消耗</button>
+              </span>
+              <span class="us-seg-sep" aria-hidden="true"></span>
+              <span class="us-seg-lab">拆分</span>
+              <span class="segmented" id="usModes" role="group" aria-label="拆分维度">
+                <button class="seg on" data-mode="total">全部消耗</button>
+                <button class="seg" data-mode="model">按模型</button>
+                <button class="seg" data-mode="brand">按品牌</button>
+                <button class="seg" data-mode="key">按 Key</button>
+              </span>
             </div>
             <!-- ECharts 需要显式高度（容器 height:100% 在嵌套盒里拿不到父高） -->
             <div id="usChart" class="uschart-body ec-body"></div>
@@ -1508,6 +1563,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div id="toasts"></div>
 
 <script src="echarts.min.js"></script>
-<script src="app.js?v=1.16.17"></script>
+<script src="app.js?v=1.16.19"></script>
 </body>
 </html>
