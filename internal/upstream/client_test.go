@@ -124,6 +124,43 @@ func TestParseSoftRateReset(t *testing.T) {
 	}
 }
 
+// TestParseBodyRetryAfter 解析上游 body 里明示的等待秒数/毫秒数。
+// 真实形态：CodeBuddy 排队 429 `{"code":6020,"msg":"queue.waiting.title",
+// "data":{"queue_position":2315,"queue_size":"999+","retry_after":40,
+// "estimated_wait":11575,...}}`——只认 retry_after 键，queue_position /
+// estimated_wait 这类大整数绝不能当秒数。
+func TestParseBodyRetryAfter(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want time.Duration
+		ok   bool
+	}{
+		{"6020 排队 retry_after=40", `{"code":6020,"msg":"queue.waiting.title","data":{"queue_position":2315,"queue_size":"999+","retry_after":40,"estimated_wait":11575}}`, 40 * time.Second, true},
+		{"6022 无 retry_after", `{"code":6022,"msg":"queue.userLimit.title","requestId":"x"}`, 0, false},
+		{"字符串形式", `{"retry_after":"25"}`, 25 * time.Second, true},
+		{"驼峰键", `{"retryAfter":15}`, 15 * time.Second, true},
+		{"毫秒字段", `{"retry_after_ms":2500}`, 2500 * time.Millisecond, true},
+		{"秒优先于毫秒", `{"retry_after":30,"retry_after_ms":9999}`, 30 * time.Second, true},
+		{"0 秒视为无信息", `{"retry_after":0}`, 0, false},
+		{"超上限丢弃", `{"retry_after":999999}`, 0, false},
+		{"只有排队位次", `{"queue_position":2315,"estimated_wait":11575}`, 0, false},
+		{"空 body", ``, 0, false},
+		{"非 JSON 文本", `please retry later`, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := ParseBodyRetryAfter(c.body)
+			if ok != c.ok {
+				t.Fatalf("ok=%v want %v (body=%s)", ok, c.ok, c.body)
+			}
+			if got != c.want {
+				t.Errorf("d=%v want %v (body=%s)", got, c.want, c.body)
+			}
+		})
+	}
+}
+
 type rtFunc func(*http.Request) (*http.Response, error)
 
 func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

@@ -44,7 +44,7 @@ type Config struct {
 	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
 	RedisMode    string
-	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
+	SoftCooldown time.Duration // 软冷却基数，默认 60s（仅在上游未给重试时间时使用；连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
@@ -93,6 +93,11 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 	}
 }
 
+// defaultSoftCooldown 上游未给任何重试时间时的软冷却基数（1 分钟）。
+// 上游一旦明说（body 重置墙钟 / Retry-After 头 / body retry_after 字段），
+// 一律以上游为准，本值只作最后兜底。
+const defaultSoftCooldown = 60 * time.Second
+
 // softCooldown 返回当前生效的软冷却基数（热改优先，<=0 回退默认）。
 func (h *Handler) softCooldown() time.Duration {
 	if d := h.loadLive().SoftCooldown; d > 0 {
@@ -101,12 +106,12 @@ func (h *Handler) softCooldown() time.Duration {
 	if h.cfg.SoftCooldown > 0 {
 		return h.cfg.SoftCooldown
 	}
-	return 600 * time.Second
+	return defaultSoftCooldown
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
 // 与 SoftCooldown 分流的原因：404 是上游**偶发**路径缺失，不是"本账号在限流"，
-// 若共用 soft_rate（600s 起 + 指数升级），一次偶发 404 会把好账号罚 10 分钟并逐次加倍。
+// 若共用 soft_rate（60s 起 + 指数升级），一次偶发 404 会被逐次加倍。
 // 故固定 60s 防雪崩即可，不随 soft_rate 配置、也不参与软退避指数。
 const notFoundCooldown = 60 * time.Second
 
@@ -148,7 +153,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.MaxRotate = 3
 	}
 	if cfg.SoftCooldown <= 0 {
-		cfg.SoftCooldown = 600 * time.Second // 软限流基数（连续触发按指数退避放大）
+		cfg.SoftCooldown = defaultSoftCooldown // 软限流基数（上游给时间时以上游为准）
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
@@ -1432,10 +1437,17 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
-		// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
-		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
-		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
+		// 冷却时长按下述优先级取「上游明说的恢复时刻」，越靠前越权威：
+		//   1. body「将在 … 重置」文案 → 精确到该墙钟。无论业务 code 是 6004 还是
+		//      11140 rate-limiting 等形态。
+		//      - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
+		//      - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
+		//   2. 响应头 Retry-After / retry-after-ms / x-ratelimit-reset。
+		//   3. body 里的 retry_after 字段：CodeBuddy 排队类 429（code 6020/6022）
+		//      会带 data.retry_after=40 —— 上游明说 40 秒后可再来。此前只认头/文案，
+		//      这 40s 的等待被放大成 soft_rate 基数。
+		//   4. 以上都没有 → 有界退避（soft_rate 基数起、softStreak 翻倍、封顶
+		//      soft_rate_max；已在冷却中的兜底探测不翻倍）。
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			if upstream.IsModelRateLimit(body) {
 				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
@@ -1445,14 +1457,25 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			return
 		}
 		// body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加）。
-		// 头优先于「有界退避」，但低于 body 重置文案（文案是上游更权威的口径）。
+		// 头优先于 body 字段：HTTP 标准头语义 > 业务自定义字段。
 		if uerr != nil && uerr.RetryAfter > 0 {
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
 			return
 		}
-		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
-		// soft_rate_max；已在冷却中的兜底探测不翻倍）。基数取 h.softCooldown()
-		// （热改优先），管理面板改 soft_rate 后立即生效。
+		// body 里的 retry_after（秒/毫秒）字段 → 同样冷却到该时刻。
+		// 走 resetAt 分支：不推进 softStreak、不做指数堆加（上游说了多久就多久，
+		// 仍受 soft_rate_max 封顶）。6004 仍保持模型级语义（只锁该模型）。
+		if d, ok := upstream.ParseBodyRetryAfter(body); ok {
+			if upstream.IsModelRateLimit(body) {
+				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), time.Now().Add(d), model, "6004 model rate limit (body retry_after)")
+				return
+			}
+			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(d), "429 rate limit (body retry_after)")
+			return
+		}
+		// 上游什么都没给 → 账号级有界退避，基数取 h.softCooldown()（热改优先），
+		// 默认 60s：一分钟足够让频控/排队窗口滑过去，又不至于像 600s 那样把
+		// 几十秒就能恢复的号白白闲置。
 		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
 	case upstream.ErrWafBlock:
 		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族：基数

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -340,6 +341,54 @@ func isAllDigits(s string) bool {
 		}
 	}
 	return true
+}
+
+// reBodyRetryAfter 匹配上游 body 里明示的重试等待秒数（CodeBuddy 排队类 429 形态：
+// {"code":6020,"msg":"queue.waiting.title","data":{"retry_after":40,...}}）。
+// 只认 `"retry_after": <纯数字>` 这一种键名（含常见变体 retryAfter/retryAfterSec），
+// 不做任意 JSON 递归——错误 body 还带 requestId/queue_position 等大整数，
+// 泛化遍历容易把「排队位次」误当秒数。
+const reBodyRetryAfter = `"(?:retry_after|retryAfter|retry_after_sec|retry_after_seconds)"\s*:\s*"?(\d{1,6})"?`
+
+// reBodyRetryAfterMS 毫秒口径的同类字段（优先于秒口径？否——两者同值时秒口径
+// 更保守（更短），毫秒字段只在没有秒字段时使用）。
+const reBodyRetryAfterMS = `"retry_after_ms"\s*:\s*"?(\d{1,9})"?`
+
+var (
+	reBodyRetryAfterVal   = regexp.MustCompile(reBodyRetryAfter)
+	reBodyRetryAfterValMS = regexp.MustCompile(reBodyRetryAfterMS)
+)
+
+// ParseBodyRetryAfter 从限流响应 body 里解析上游明示的等待时长（秒或毫秒字段）。
+//
+// 与 ParseRetryAfter（响应头）同口径：返回值是**时长**而非墙钟；非正/超过
+// retryAfterSanity 的值视为上游异常丢弃（调用方回落本地计算，绝不臆造）。
+//
+// 优先级由调用方决定：body 的「将在 … 重置」文案（ParseRateReset）>
+// 响应头（ParseRetryAfter）> body 的 retry_after 字段（本函数）> 本地退避。
+// 之所以把字段排在头之后：头部是 HTTP 层标准语义，字段是业务自定义；两者冲突时
+// 更权威的是标准头（队列位置类文案字段历史上有过"预计等待"而非"必须等待"的语义）。
+func ParseBodyRetryAfter(body string) (time.Duration, bool) {
+	if body == "" {
+		return 0, false
+	}
+	if m := reBodyRetryAfterVal.FindStringSubmatch(body); len(m) == 2 {
+		if n, err := strconv.Atoi(m[1]); err == nil {
+			d := time.Duration(n) * time.Second
+			if d > 0 && d <= retryAfterSanity {
+				return d, true
+			}
+		}
+	}
+	if m := reBodyRetryAfterValMS.FindStringSubmatch(body); len(m) == 2 {
+		if n, err := strconv.Atoi(m[1]); err == nil {
+			d := time.Duration(n) * time.Millisecond
+			if d > 0 && d <= retryAfterSanity {
+				return d, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // parseRetryNumber 按头名口径把纯数字串折算成时长。x-ratelimit-reset 是

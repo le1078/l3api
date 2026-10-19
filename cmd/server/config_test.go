@@ -17,8 +17,8 @@ func TestDefault(t *testing.T) {
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	if c.SoftRateDur.Seconds() != 600 {
-		t.Errorf("soft=%v want 600s", c.SoftRateDur)
+	if c.SoftRateDur.Seconds() != 60 {
+		t.Errorf("soft=%v want 60s（上游未给重试时间时的兜底基数）", c.SoftRateDur)
 	}
 }
 

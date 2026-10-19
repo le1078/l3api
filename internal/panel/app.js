@@ -2429,6 +2429,18 @@ function renderUsageChart(snap) {
 
   const hostW = Math.max(320, host.clientWidth - 34); // 减左右 padding，估图例换行用
 
+  // 容器高度必须在 echarts.init **之前**定好：init 那一刻按容器当前高度建 canvas，
+  // 事后再改 host.style.height 而不 resize，canvas 保持旧尺寸溢出容器——多图例行
+  // （按模型/按 Key，可达 300+px）切回单线（CSS 260px）时，x 轴时间标签被挤出卡片
+  // 底部，压到图表脚注那行小字上（v1.16.20 实测：积分消耗·全部消耗 左下角重叠）。
+  // 所以这里先按模式给一个预估高度，init 后的真实图例高度再校正一次。
+  const preRows = isMulti
+    ? Math.max(1, Math.round(usLegendEstimate(named.map(s => s.name), hostW) / 20))
+    : 1;
+  host.style.height = isMulti
+    ? Math.max(300, 260 + (preRows - 1) * 20) + 'px'
+    : ''; // 单线：回归 CSS 基准（.uschart-body.ec-body 260px）
+
   const two = n => String(n).padStart(2, '0');
   const whenOf = ms => { const d = new Date(ms); return two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' + two(d.getHours()) + ':00'; };
 
@@ -2562,10 +2574,12 @@ function renderUsageChart(snap) {
     usChartInstance.setOption({ grid: { bottom: gb } });
     // 容器高度随图例行数增长（CSS 里的 260px 是单线模式的基准）
     const rows = Math.max(1, Math.round(lgH / 20));
-    host.style.height = Math.max(300, 260 + Math.max(0, rows - 1) * 20) + 'px';
+    const want = Math.max(300, 260 + Math.max(0, rows - 1) * 20);
+    if (Math.abs(parseFloat(host.style.height) - want) > 0.5) host.style.height = want + 'px';
     usChartInstance.resize();
   } else {
-    host.style.height = '';
+    host.style.height = ''; // 单线回归 CSS 基准，已在 init 前设过，这里兜底清内联样式
+    usChartInstance.resize();
   }
 
   // 图例开关记住（切模式 / 刷新后保持）。selected 以 ECharts 的实时状态为准，

@@ -488,9 +488,69 @@ func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
 	}
 }
 
+// TestApplyErrorPolicySoftRateUsesBodyRetryAfter 上游 body 里的 retry_after
+// 优先于本地基数：6020/6022 排队类 429 带 data.retry_after=40 → 只冷却 40s，
+// 而不是 soft_rate 基数的 600s。不推进 softStreak（上游明说的时间不做指数堆加）。
+func TestApplyErrorPolicySoftRateUsesBodyRetryAfter(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
+
+	body := `{"code":6020,"msg":"queue.waiting.title","data":{"queue_position":2315,"queue_size":"999+","retry_after":40,"estimated_wait":11575}}`
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, body, "step-5-preview", &upstream.Error{Kind: upstream.ErrSoftRate, Status: 429})
+
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("应为 soft_rate 冷却: %+v", st)
+	}
+	if st.CoolRemaining < 40-2 || st.CoolRemaining > 40 {
+		t.Errorf("cool_remaining_sec=%d want ~40（取 body retry_after，而非 600 基数）", st.CoolRemaining)
+	}
+	if st.SoftStreak != 0 {
+		t.Errorf("上游明说时间不应推进 soft_streak, got %d", st.SoftStreak)
+	}
+	if !strings.Contains(st.Reason, "body retry_after") {
+		t.Errorf("reason=%q want 标注 body retry_after（运维可辨识来源）", st.Reason)
+	}
+}
+
+// TestApplyErrorPolicySoftRateFallsBackTo60s 上游既无「将在…重置」文案、
+// 无 Retry-After 头、body 也无 retry_after → 回落到默认 60s 兜底基数。
+func TestApplyErrorPolicySoftRateFallsBackTo60s(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	h := NewHandler(Config{Pool: p}) // 不注入，取默认
+
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, `{"code":6022,"msg":"queue.userLimit.title"}`, "step-5-preview", nil)
+
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("应为 soft_rate 冷却: %+v", st)
+	}
+	if st.CoolRemaining <= 59 || st.CoolRemaining > 60 {
+		t.Errorf("cool_remaining_sec=%d want ~60（无上游时间时的兜底基数）", st.CoolRemaining)
+	}
+}
+
+// TestApplyErrorPolicyBodyRetryAfterCapped 上游给的 retry_after 仍受 soft_rate_max 封顶，
+// 避免异常大的值把号长时间锁死。
+func TestApplyErrorPolicyBodyRetryAfterCapped(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(2 * time.Minute)
+	h := NewHandler(Config{Pool: p})
+
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, `{"retry_after":3600}`, "step-5-preview", nil)
+
+	st, _ := p.Status("u1")
+	if st.CoolRemaining <= 119 || st.CoolRemaining > 120 {
+		t.Errorf("cool_remaining_sec=%d want ~120（soft_rate_max 封顶）", st.CoolRemaining)
+	}
+}
+
 func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 	// 404 分流：偶发上游 404 的冷却基数固定 60s（notFoundCooldown），不取 soft_rate
-	// 的 600s 基数，也不受其配置值影响。Cooldown 重构后 404 是固定时长冷却
+	// 的基数，也不受其配置值影响。Cooldown 重构后 404 是固定时长冷却
 	//（不堆加、不喂熔断），成功后自然到期恢复。
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -514,7 +574,8 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 	}
 }
 
-// TestNewHandlerSoftCooldownDefault 端到端：未注入 SoftCooldown 时基数回落到 600s（原为 60s）。
+// TestNewHandlerSoftCooldownDefault 端到端：未注入 SoftCooldown 时基数回落到 60s
+// （上游未给任何重试时间时的兜底）。
 func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz == "Bearer at-bad" {
@@ -539,8 +600,8 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	if !st.Cooling || st.CoolKind != "soft_rate" {
 		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
 	}
-	if st.CoolRemaining <= 599 || st.CoolRemaining > 600 {
-		t.Errorf("default soft cooldown cool_remaining_sec=%d want 600", st.CoolRemaining)
+	if st.CoolRemaining <= 59 || st.CoolRemaining > 60 {
+		t.Errorf("default soft cooldown cool_remaining_sec=%d want 60", st.CoolRemaining)
 	}
 }
 
