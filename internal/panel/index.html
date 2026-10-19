@@ -204,10 +204,22 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
 .stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
 .stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
-/* 卡片副行（积分卡的「今日消耗」）：比主标签更轻，数字用语义色强调消耗。 */
-.stat .sub { color: var(--ink-3); font-size: 11.5px; margin-top: 2px; white-space: nowrap; }
-.stat .sub b { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--warn); }
 .stat.good .v { color: var(--ok); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
+/* 5 张卡（v1.16.15 新增「今日消耗」）在宽屏之外会挤：「1,044 · 234.03M」
+   这种长值超过卡片内容宽就被裁（nowrap + tabular-nums 不会自己缩）。
+   按窗口宽度分三档降字号与内边距——数值保持完整，只缩字号。 */
+@media (max-width: 1400px) {
+  .stat { padding: 12px 13px; }
+  .stat .v { font-size: 20px; }
+}
+@media (max-width: 1250px) {
+  .stat { padding: 11px 11px; }
+  .stat .v { font-size: 18px; }
+  .stat .k { font-size: 11px; }
+}
+@media (max-width: 1150px) {
+  .stat .v { font-size: 16.5px; letter-spacing: -.03em; }
+}
 
 /* ── 面板块 ───────────────────────────────────────────────────────── */
 .box { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
@@ -584,37 +596,36 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 #logBox .lg-line.e { color: var(--bad); }
 #logBox .lg-line.w { color: var(--warn); }
 
+/* 对话行：**单行**（v1.16.15）。v1.16.14 的两行卡片一屏只放得下 4~5 条，
+   翻日志要滚很久；这里压成一行——时间 · 模型 · 状态 · 指标，用间距与颜色
+   分组，不用竖线。左侧保留 2px 色条编码健康度（绿/黄/红），比整块卡片更省地方。 */
 #logBox .lg-chat {
-  display: block; padding: 8px 11px 9px; margin: 5px 0; border-radius: 8px;
-  border: 1px solid var(--line-soft); background: var(--surface-2);
-  border-left: 2px solid var(--ok);
+  display: flex; align-items: baseline; gap: 8px; min-width: 0;
+  padding: 3px 9px; margin: 0 0 1px; border-radius: 5px;
+  border-left: 2px solid var(--ok); background: transparent;
+  font-size: 12px; line-height: 1.75; white-space: nowrap;
 }
+#logBox .lg-chat:hover { background: var(--surface-2); }
 #logBox .lg-chat.slow { border-left-color: var(--warn); }
 #logBox .lg-chat.err  { border-left-color: var(--bad); }
-#logBox .lg-chat > .hd {
-  display: flex; align-items: baseline; gap: 8px; min-width: 0;
-}
 #logBox .lg-chat .ts { color: var(--ink-3); font-size: 11px; flex: none; font-variant-numeric: tabular-nums; }
 #logBox .lg-chat .mdl {
-  font: 600 12.5px/1.4 var(--mono); color: var(--ink); min-width: 0;
-  overflow-wrap: anywhere;   /* 完整模型名，长名折行不截断 */
+  font: 600 12px/1.75 var(--mono); color: var(--ink);
+  flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
 }
-#logBox .lg-chat .seq { margin-left: auto; flex: none; color: var(--ink-3); font-size: 10.5px; }
-#logBox .lg-chat > .bd {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 5px 6px; margin-top: 5px;
-}
+/* 指标区：纯文本 + 细间隔点，不再用一叠胶囊（那是两行方案才需要的） */
+#logBox .lg-chat .bd { display: flex; align-items: baseline; gap: 0; min-width: 0; overflow: hidden; }
 #logBox .lg-chat .kv {
-  display: inline-flex; align-items: baseline; gap: 4px;
-  padding: 1px 7px; border-radius: 5px; font-size: 11px;
-  background: var(--surface); border: 1px solid var(--line-soft); color: var(--ink-2);
-  font-variant-numeric: tabular-nums;
+  display: inline-flex; align-items: baseline; gap: 3px; flex: none;
+  font-size: 11.5px; color: var(--ink-3); font-variant-numeric: tabular-nums;
 }
-#logBox .lg-chat .kv b { font-weight: 650; color: var(--ink); }
-#logBox .lg-chat .kv.ok   { color: var(--ok);   border-color: color-mix(in srgb, var(--ok) 22%, transparent);   background: var(--ok-soft); }
-#logBox .lg-chat .kv.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 22%, transparent); background: var(--warn-soft); }
-#logBox .lg-chat .kv.bad  { color: var(--bad);  border-color: color-mix(in srgb, var(--bad) 22%, transparent);  background: var(--bad-soft); }
-#logBox .lg-chat .kv.mute { color: var(--ink-3); }
-#logBox .lg-chat .kv em { font-style: normal; font-size: 10px; opacity: .8; }
+#logBox .lg-chat .kv + .kv::before { content: '·'; margin: 0 7px; color: var(--line); }
+#logBox .lg-chat .kv b { font-weight: 600; color: var(--ink-2); }
+#logBox .lg-chat .kv.ok   b { color: var(--ok); }
+#logBox .lg-chat .kv.warn b { color: var(--warn); }
+#logBox .lg-chat .kv.bad  b { color: var(--bad); }
+#logBox .lg-chat .kv.mute { color: var(--ink-3); opacity: .8; }
+#logBox .lg-chat .seq { margin-left: auto; flex: none; color: var(--ink-3); font-size: 10.5px; opacity: .7; }
 
 /* ── 配置表单 ─────────────────────────────────────────────────────── */
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
@@ -809,13 +820,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <section class="view" id="view-accounts">
       <!-- 顶部只留全局量：账号状态计数（总数/可用/冷却/禁用）由下方品牌墙与
            总统计条承担，同屏重复三遍会训练用户全部忽略，真异常反而看不见。
-           卡片语义分工：存量（积分）→ 产出（今日请求/Token）→ 负载（在途）
-           → 会话（粘性）。 -->
+           卡片语义分工：存量（积分剩余）→ 消耗（今日积分）→ 产出（今日请求/Token）
+           → 负载（在途）→ 会话（粘性）。 -->
       <div class="stats">
-        <!-- 积分卡同时给「剩余 / 总额」与「今日消耗」：存量与产出放一起，
-             避免为一个小数字再加一张卡（5 卡在 1500px 下会把每卡挤窄）。 -->
-        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div>
-          <div class="sub">今日消耗 <b id="sCreditsToday">-</b></div></div>
+        <!-- 今日消耗独立成卡（v1.16.15）：挂在积分卡下面会让该卡比其他卡高出一行，
+             且五个值的底边不再对齐（截图里右侧大片留白）。独立成卡后五张卡等高。 -->
+        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
+        <div class="stat warn"><div class="v" id="sCreditsToday">-</div><div class="k">今日消耗积分</div></div>
         <div class="stat"><div class="v" id="sToday">-</div><div class="k">今日请求 · Token</div></div>
         <div class="stat"><div class="v" id="sInFlight">-</div><div class="k">在途请求</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
@@ -1497,6 +1508,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div id="toasts"></div>
 
 <script src="echarts.min.js"></script>
-<script src="app.js?v=1.16.14"></script>
+<script src="app.js?v=1.16.17"></script>
 </body>
 </html>

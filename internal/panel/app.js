@@ -1046,15 +1046,14 @@ async function loadLogs() {
   } catch (e) { /* 概览已提示 */ }
 }
 
-/* logEntryHTML 渲染一条日志。
-   - 对话行（后端已解析成 row）：两行卡片——第一行「时间 · 完整模型名 · 状态 ·
-     序号」，第二行指标 chips（流式/同步、TTFB、tok、tok/s、总耗时）。行内那个
-     与 TS 重复的时刻**不再展示**（用户困惑「为什么每行两个时间」的根因）。
+/* logEntryHTML 渲染一条日志（都是**单行**，v1.16.15 起）。
+   - 对话行（后端已解析成 row）：时间 · 完整模型名 · 状态 · 指标，一行铺开；
+     不用两行卡片——一屏 4~5 条的密度看日志得翻很久。行内那个与 TS 重复的
+     时刻**不再展示**（「每行两个时间」困惑的根因）。
    - 任务/系统行：等宽文本，保留终端质感与级别着色。
    - row 缺失（老格式/解析失败）：退回原始文本，信息不丢。 */
 function logEntryHTML(e) {
-  // 时间只显示到秒：后端 TS 带纳秒，toLocaleTimeString 在 part 里会带毫秒尾巴。
-  // 日志扫读只需要「几点几分几秒」，毫秒纯噪音。
+  // 时间只显示到秒：后端 TS 带纳秒，不显式指定时分秒会带毫秒尾巴。
   const t = e.ts
     ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
     : '';
@@ -1065,15 +1064,14 @@ function logEntryHTML(e) {
   if (e.ch === 'chat' && e.row) {
     const r = e.row;
     const ok = r.status >= 200 && r.status < 300;
-    // 慢请求以 8s 为线（实测 TTFB 常见 7–8s，再慢就是上游异常），标黄不标红：
-    // 失败才红，慢只是提醒。
+    // 慢请求以 8s 为线（实测 TTFB 常见 7–8s，再慢就是上游异常），标黄不标红。
     const slow = ok && r.total_ms >= 8000;
     const cls = ok ? (slow ? ' slow' : '') : ' err';
     const statusCls = ok ? (slow ? 'warn' : 'ok') : 'bad';
     const kv = (label, val, extra) =>
       '<span class="kv' + (extra ? ' ' + extra : '') + '">' + label + '<b>' + esc(val) + '</b></span>';
-    let metrics = '';
-    metrics += kv('', r.mode === 'stream' ? '流式' : '同步', 'mute');
+    let metrics = kv('', r.mode === 'stream' ? '流式' : '同步', 'mute');
+    metrics += kv('', 'HTTP ' + r.status, statusCls);
     if (r.ttfb_ms > 0) metrics += kv('首字 ', fmtMs(r.ttfb_ms), r.ttfb_ms >= 8000 ? 'warn' : '');
     if (r.tokens >= 0) {
       metrics += kv('产出 ', fmtTok(r.tokens) + ' tok');
@@ -1081,15 +1079,12 @@ function logEntryHTML(e) {
     } else {
       metrics += '<span class="kv mute">无 usage</span>';
     }
-    metrics += kv('总耗时 ', (r.total_ms / 1000).toFixed(1) + 's', slow ? 'warn' : '');
-    return '<span class="lg-chat' + cls + '">' +
-      '<span class="hd">' + chBadge +
-        '<span class="ts">' + esc(t) + '</span>' +
-        '<span class="mdl" title="' + esc(r.model) + '">' + esc(r.model) + '</span>' +
-        '<span class="kv ' + statusCls + '">' + r.status + '</span>' +
-        '<span class="seq">#' + r.seq + '</span>' +
-      '</span>' +
+    metrics += kv('耗时 ', (r.total_ms / 1000).toFixed(1) + 's', slow ? 'warn' : '');
+    return '<span class="lg-chat' + cls + '">' + chBadge +
+      '<span class="ts">' + esc(t) + '</span>' +
+      '<span class="mdl" title="' + esc(r.model) + '">' + esc(r.model) + '</span>' +
       '<span class="bd">' + metrics + '</span>' +
+      '<span class="seq">#' + r.seq + '</span>' +
       '</span>';
   }
 
