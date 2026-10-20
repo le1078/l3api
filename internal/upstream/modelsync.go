@@ -261,7 +261,10 @@ func parseQoderModelList(raw []byte) ([]QoderModel, error) {
 			PriceFactor         *float64 `json:"price_factor"`
 			OriginalPriceFactor *float64 `json:"original_price_factor"`
 			IsFree              *bool    `json:"is_free"`
-			ContextConfig       map[string]struct {
+			Description         *struct {
+				Zh string `json:"zh"`
+			} `json:"description"`
+			ContextConfig map[string]struct {
 				TokenCount int64 `json:"token_count"`
 				IsDefault  bool  `json:"is_default"`
 			} `json:"context_config"`
@@ -307,6 +310,12 @@ func parseQoderModelList(raw []byte) ([]QoderModel, error) {
 		if e.IsFree != nil && *e.IsFree {
 			m.IsFree = true
 		}
+		if e.Description != nil && e.Description.Zh != "" {
+			m.Description = e.Description.Zh
+		}
+		// 官方 API 不下发免费截止日（仅 is_free=true）；客户端介绍里才有。
+		// 用已知活动规则补齐（qoderFreeUntil），并在说明里带上截止时间。
+		applyQoderFreeUntil(&m)
 		if e.OriginalPriceFactor != nil && *e.OriginalPriceFactor != *e.PriceFactor {
 			m.OriginalCredits = qoderCreditsText(e.OriginalPriceFactor)
 		}
@@ -388,6 +397,33 @@ func parseQoderModelList(raw []byte) ([]QoderModel, error) {
 
 // ptrF 取 float64 地址（构造临时 *float64 供 qoderCreditsText）。
 func ptrF(v float64) *float64 { return &v }
+
+// qoderFreeUntil 已知的 Qoder 免费活动截止（客户端介绍文案，API 不下发）。
+// map[key] = RFC3339 截止时间 + 说明；活动结束请更新此处（与 docs 活动页同步）。
+var qoderFreeUntil = map[string]struct {
+	until string
+	note  string
+}{
+	// 个人版限时免费畅用，至 10月25日 00:00（UTC+8）——DeepSeek-V4.1-Flash-1017
+	"dfmodel": {until: "2026-10-25T00:00:00+08:00", note: "个人版限时免费畅用，至 10月25日 00:00（UTC+8）"},
+	// Qwen3.8-Flash 限时免费（9/18 起延期，结束时间以官方活动页为准）
+	"qfmodel": {until: "", note: "限时免费使用（结束时间以官方活动页为准）"},
+}
+
+// applyQoderFreeUntil 给 is_free 模型补官方说明与免费截止（API 无此字段时的兜底）。
+func applyQoderFreeUntil(m *QoderModel) {
+	if !m.IsFree {
+		return
+	}
+	if u, ok := qoderFreeUntil[m.ID]; ok {
+		if u.until != "" {
+			m.ValidUntil = u.until
+		}
+		if u.note != "" && m.Description == "" {
+			m.Description = u.note
+		}
+	}
+}
 
 // qoderCreditsText price_factor → 面板积分倍率原文（与 WorkBuddy 的 "x0.05" 同形）。
 // is_free 的模型 price_factor=0 → "x0.00"（面板按免费渲染）。nil → 空（不编造）。

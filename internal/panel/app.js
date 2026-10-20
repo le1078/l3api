@@ -969,6 +969,7 @@ async function loadModels() {
       if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
       if (m.badge) caps.push('<span class="tag bad"' + (promoOf(m) && promoOf(m).text ? ' title="' + esc(promoOf(m).text) + '"' : '') + '>' + esc(m.badge) + '</span>');
       const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
+      // 官方模型说明/免费截止（qoder/trae 客户端介绍文案）挂在模型名上悬浮可见。
       const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
       const bdg = m.brand ? brandBadge(m.brand) : '';
       // 主展示 = 真实调用名（call_id，含品牌/域前缀，客户端原样填进 model 字段）；

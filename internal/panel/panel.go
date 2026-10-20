@@ -519,8 +519,19 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		if len(qm.ContextTiers) > 0 {
 			entry["context_tiers"] = qm.ContextTiers
 		}
+		if qm.Description != "" {
+			entry["description"] = qm.Description
+		}
+		if qm.ValidUntil != "" {
+			entry["valid_until"] = qm.ValidUntil
+		}
 		if pm := brandPromotionJSON(qm.Badge, qm.PromotionNote, qm.PromotionWindow, qm.PromotionTZ,
-			qm.PromotionFactor, qm.PromotionCredit, "", qm.IsFree); pm != nil {
+			qm.PromotionFactor, qm.PromotionCredit, qm.ValidUntil, qm.IsFree); pm != nil {
+			if qm.Description != "" {
+				if pm["text"] == nil {
+					pm["text"] = qm.Description
+				}
+			}
 			entry["promotion"] = pm
 		}
 		out = append(out, entry)
@@ -546,8 +557,17 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		if len(tm.ContextTiers) > 0 {
 			entry["context_tiers"] = tm.ContextTiers
 		}
+		if tm.Description != "" {
+			entry["description"] = tm.Description
+		}
+		if tm.ValidUntil != "" {
+			entry["valid_until"] = tm.ValidUntil
+		}
 		if pm := brandPromotionJSON(tm.Badge, tm.PromotionNote, tm.PromotionWindow, tm.PromotionTZ,
 			tm.PromotionFactor, tm.PromotionCredit, tm.ValidUntil, false); pm != nil {
+			if tm.Description != "" && pm["text"] == nil {
+				pm["text"] = tm.Description
+			}
 			entry["promotion"] = pm
 		}
 		out = append(out, entry)
@@ -591,6 +611,14 @@ func brandPromotionJSON(badge, note, window, tz string, factor float64, credit, 
 	}
 	if validUntil != "" {
 		m["valid_until"] = validUntil
+		// 人读截止（YYYY-MM-DD HH:MM）写进说明，面板悬浮可见。
+		if m["text"] == nil {
+			t := validUntil
+			if len(t) >= 16 {
+				t = t[:10] + " " + t[11:16]
+			}
+			m["text"] = "限时免费，至 " + t
+		}
 	}
 	// 有日窗/截止时间时现算 active；全时段免费/无窗口 → 恒真。
 	m["active"] = true

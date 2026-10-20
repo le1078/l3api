@@ -45,6 +45,7 @@ type TraeModel struct {
 	PromotionFactor float64 `json:"promotion_factor,omitempty"`
 	PromotionCredit string  `json:"promotion_credit,omitempty"`
 	ValidUntil      string  `json:"valid_until,omitempty"` // 限时活动截止（RFC3339）
+	Description     string  `json:"description,omitempty"` // 官方模型说明/活动文案（display_config 或客户端介绍）
 }
 
 // TraeChatModels 返回 Trae 预设模型目录（2026-10-09 get_detail_param 复测）。

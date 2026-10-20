@@ -29,6 +29,8 @@ type QoderModel struct {
 	// 免费/促销（2026-10-21）：与 WorkBuddy 的 badge+promotion 同口径透出。
 	IsFree          bool    `json:"is_free,omitempty"`          // 官方 is_free=true（全时段免费）
 	OriginalCredits string  `json:"original_credits,omitempty"` // 原价倍率（is_free 时的 original_price_factor）
+	Description     string  `json:"description,omitempty"`      // 官方模型说明/免费截止（客户端介绍文案）
+	ValidUntil      string  `json:"valid_until,omitempty"`      // 免费/活动截止（RFC3339；is_free 带截止时）
 	ContextTiers    []int64 `json:"context_tiers,omitempty"`    // context_config 各档 token_count（200K/400K/1M）
 	Badge           string  `json:"badge,omitempty"`            // 促销徽章（"错峰 4 折"）
 	PromotionNote   string  `json:"promotion_note,omitempty"`   // 促销原文说明（description.zh）
