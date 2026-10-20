@@ -230,3 +230,61 @@ func (h hostRewrite) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func rewriteHost(base string) http.RoundTripper { return hostRewrite{base: base} }
+
+// ── 流内 provider_error（2026-10-21）────────────────────────────────────────
+
+// TestQoderChatStream_ProviderErrorVisible 流内业务错误必须既让客户端看到
+// 真实原因，又让 handler 拿到 *Error 做分类。
+//
+// 回归背景：Qoder 网关把上游模型侧错误包在 HTTP 200 的 SSE 信封里回传
+// （statusCodeValue=400 + body.code="provider_error"）。此前这类帧被当成
+// 正常数据透传——客户端只收到空帧 + [DONE]，无任何报错（用户侧表现为
+// 「模型跑几秒就断开」），handler 也无从分类换号。
+func TestQoderChatStream_ProviderErrorVisible(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		detail := `{\"error\":{\"message\":\"Failed to deserialize the JSON body into the target type: messages[2]: missing field tool_call_id\"}}`
+		inner := `{"code":"provider_error","message":"Error in upstream response","type":"provider_error","details":"` + detail + `"}`
+		// 信封形态：HTTP 200 + statusCodeValue=400（错误只在信封里）。
+		fmt.Fprintf(w, "data:{\"body\":%s,\"statusCodeValue\":400,\"statusCode\":\"BAD_REQUEST\"}\n\n", jsonStr(inner))
+	}))
+	defer srv.Close()
+
+	c := New()
+	a := newQoderTestAuth()
+	c.ChatHTTP = &http.Client{Transport: rewriteHost(srv.URL)}
+	c.HTTP = c.ChatHTTP
+
+	rc, status, _, err := c.QoderChatStream(context.Background(), a, []byte(
+		`{"messages":[{"role":"user","content":"hi"}]}`), "conv-err", "qfmodel")
+	if err != nil {
+		t.Fatalf("开流阶段不应报错（错误在流内）：%v", err)
+	}
+	if status != 200 {
+		t.Fatalf("status = %d", status)
+	}
+	out, rerr := io.ReadAll(rc)
+	rc.Close()
+	got := string(out)
+	// 客户端必须看到 OpenAI error 帧 + 上游真实原因。
+	if !strings.Contains(got, `"error"`) {
+		t.Fatalf("error frame missing:\n%s", got)
+	}
+	if !strings.Contains(got, "missing field") {
+		t.Fatalf("upstream reason missing:\n%s", got)
+	}
+	// handler 必须拿到可分类的 *Error（请求体畸形 → ErrBadParams，不罚号）。
+	if rerr == nil {
+		t.Fatal("read 应返回 *Error 供 handler 分类")
+	}
+	ue, ok := rerr.(*Error)
+	if !ok {
+		t.Fatalf("err type %T, want *Error", rerr)
+	}
+	if ue.Kind != ErrBadParams {
+		t.Fatalf("kind = %v, want ErrBadParams", ue.Kind)
+	}
+	if ue.Status != 400 {
+		t.Fatalf("status = %d, want 400", ue.Status)
+	}
+}
