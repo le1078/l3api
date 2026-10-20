@@ -11,8 +11,9 @@ import (
 
 func TestParseQoderModelList(t *testing.T) {
 	raw := []byte(`{"chat":[
-		{"key":"auto","display_name":"Auto","is_vl":true,"is_reasoning":true,"max_input_tokens":200000,"enable":true},
-		{"key":"gmodel","display_name":"GLM-5.3","is_vl":true,"is_reasoning":true,"max_input_tokens":180000,"enable":true},
+		{"key":"auto","display_name":"Auto","is_vl":true,"is_reasoning":true,"max_input_tokens":200000,"enable":true,"price_factor":0.5},
+		{"key":"gmodel","display_name":"GLM-5.3","is_vl":true,"is_reasoning":true,"max_input_tokens":180000,"enable":true,"price_factor":0.2,
+		 "thinking_config":{"enabled":{"is_default":true,"efforts":{"low":{},"high":{},"max":{"is_default":true}}}}},
 		{"key":"off","display_name":"Off","is_vl":false,"is_reasoning":false,"max_input_tokens":1000,"enable":false}
 	],"developer":[{"key":"x"}]}`)
 	ms, err := parseQoderModelList(raw)
@@ -24,6 +25,20 @@ func TestParseQoderModelList(t *testing.T) {
 	}
 	if ms[0].MaxInputTokens != 200000 || !ms[0].IsReasoning {
 		t.Fatalf("fields: %+v", ms[0])
+	}
+	// 五列能力字段（2026-10-21）：price_factor→credits、thinking_config→efforts、
+	// max_output 按窗口 1/4 估算。
+	if ms[1].Credits != "x0.20" {
+		t.Fatalf("gmodel credits=%q want x0.20", ms[1].Credits)
+	}
+	if ms[1].MaxOutputTokens != 45000 {
+		t.Fatalf("gmodel max_output=%d want 45000", ms[1].MaxOutputTokens)
+	}
+	if ms[1].DefaultEffort != "max" || len(ms[1].Efforts) != 3 {
+		t.Fatalf("gmodel efforts=%v def=%q", ms[1].Efforts, ms[1].DefaultEffort)
+	}
+	if got := ms[0].MaxOutputTokens; got != 50000 {
+		t.Fatalf("auto max_output=%d want 50000", got)
 	}
 	// 空 chat 组 = 解析失败（不落盘空目录）
 	if _, err := parseQoderModelList([]byte(`{"chat":[]}`)); err == nil {

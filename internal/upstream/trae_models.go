@@ -17,12 +17,21 @@ package upstream
 
 // TraeModel Trae 模型条目。
 // JSON tag 供 model_sync.json 覆盖文件落盘/读取（modelsync.go）。
+//
+// 2026-10-21 补齐面板「模型与档位」五列（与 WorkBuddy 动态目录同口径）：
+// consumption_rate→credits、reasoning_effort_config→efforts/default_effort、
+// model_detail_list[0].max_tokens→MaxOutputTokens。
 type TraeModel struct {
-	ID          string `json:"id"`           // 上游 config_name（大小写敏感，原样透出）
-	Name        string `json:"name"`         // 展示名
-	IsReasoning bool   `json:"is_reasoning"`
-	IsVL        bool   `json:"is_vl"`
-	MaxTokens   int    `json:"max_tokens"`   // context_window_tokens.dev（客户端实际生效窗）
+	ID                 string   `json:"id"`   // 上游 config_name（大小写敏感，原样透出）
+	Name               string   `json:"name"` // 展示名
+	IsReasoning        bool     `json:"is_reasoning"`
+	IsVL               bool     `json:"is_vl"`
+	MaxTokens          int      `json:"max_tokens"`                     // context_window_tokens.dev（客户端实际生效窗）
+	Credits            string   `json:"credits,omitempty"`              // 消耗倍率（display_contact_config.consumption_rate，归一 "x0.78"）
+	MaxOutputTokens    int64    `json:"max_output_tokens,omitempty"`    // model_detail_list[0].max_tokens（0=未知）
+	Efforts            []string `json:"efforts,omitempty"`              // reasoning_effort_config.options（空=固定档/不可调）
+	DefaultEffort      string   `json:"default_effort,omitempty"`       // reasoning_effort_config.default_level
+	CanDisableThinking bool     `json:"can_disable_thinking,omitempty"` // 目前恒 false（Trae 未下发 disabled 档）
 }
 
 // TraeChatModels 返回 Trae 预设模型目录（2026-10-09 get_detail_param 复测）。
@@ -42,35 +51,65 @@ func TraeChatModels() []TraeModel {
 }
 
 // traeSeedModels 种子目录（Go 源码内嵌，人工实测口径；兜底用）。
+// 2026-10-21 get_detail_param 复测补齐 credits/efforts/max_output（详见
+// TraeModel 字段注释与 modelsync.go 的 parseTraeDetailParam）。
 func traeSeedModels() []TraeModel {
 	return []TraeModel{
-		{ID: "glm-5.3", Name: "GLM-5.3", IsReasoning: true, IsVL: true, MaxTokens: 116000},
-		{ID: "glm-5.3-flash", Name: "GLM-5.3-Flash", IsReasoning: true, IsVL: false, MaxTokens: 116000},
-		{ID: "glm-5.3-flashx", Name: "GLM-5.3-FlashX", IsReasoning: false, IsVL: false, MaxTokens: 116000},
-		{ID: "glm-5.2", Name: "GLM-5.2", IsReasoning: true, IsVL: true, MaxTokens: 116000},
-		{ID: "glm-5.1", Name: "GLM-5.1", IsReasoning: true, IsVL: true, MaxTokens: 116000},
-		{ID: "glm-4.7", Name: "GLM-4.7", IsReasoning: true, IsVL: true, MaxTokens: 116000},
-		{ID: "kimi-k3", Name: "Kimi-K3", IsReasoning: true, IsVL: true, MaxTokens: 200000},
-		{ID: "kimi-k2.8-preview", Name: "Kimi-K2.8-Preview", IsReasoning: true, IsVL: true, MaxTokens: 200000},
-		{ID: "kimi-k2.7-code", Name: "Kimi-K2.7-Code", IsReasoning: true, IsVL: false, MaxTokens: 200000},
-		{ID: "kimi-k2", Name: "Kimi-K2", IsReasoning: true, IsVL: true, MaxTokens: 116000},
-		{ID: "DeepSeek-V4-Pro", Name: "DeepSeek-V4-Pro", IsReasoning: true, IsVL: true, MaxTokens: 116000},
-		{ID: "DeepSeek-V4-Flash", Name: "DeepSeek-V4-Flash", IsReasoning: true, IsVL: false, MaxTokens: 116000},
-		{ID: "DeepSeek-V4-Pro-Official", Name: "DeepSeek-V4-Pro-Official", IsReasoning: true, IsVL: true, MaxTokens: 116000},
-		{ID: "DeepSeek-V4-Flash-Official", Name: "DeepSeek-V4-Flash-Official", IsReasoning: true, IsVL: false, MaxTokens: 116000},
-		{ID: "deepseek-v4.1-flash", Name: "DeepSeek-V4.1-Flash", IsReasoning: false, IsVL: false, MaxTokens: 116000},
-		{ID: "Doubao-Seed-2.1-Pro", Name: "Doubao-Seed-2.1-Pro", IsReasoning: true, IsVL: true, MaxTokens: 256000},
-		{ID: "Doubao-Seed-2.1-Turbo", Name: "Doubao-Seed-2.1-Turbo", IsReasoning: false, IsVL: true, MaxTokens: 256000},
-		{ID: "Doubao-Seed-Code", Name: "Doubao-Seed-Code", IsReasoning: true, IsVL: false, MaxTokens: 256000},
-		{ID: "Doubao-Seed-Evolving", Name: "Seed-Evolving", IsReasoning: true, IsVL: true, MaxTokens: 256000},
-		{ID: "qwen3.8-max", Name: "Qwen3.8-Max", IsReasoning: true, IsVL: true, MaxTokens: 200000},
-		{ID: "qwen3.8-flash", Name: "Qwen3.8-Flash", IsReasoning: false, IsVL: false, MaxTokens: 200000},
-		{ID: "qwen-3.7-plus", Name: "Qwen3.7-Plus", IsReasoning: true, IsVL: true, MaxTokens: 200000},
-		{ID: "qwen3-coder", Name: "Qwen3-Coder", IsReasoning: true, IsVL: false, MaxTokens: 116000},
-		{ID: "minimax-m3", Name: "MiniMax-M3", IsReasoning: true, IsVL: true, MaxTokens: 116000},
-		{ID: "minimax-m2.1", Name: "MiniMax-M2.1", IsReasoning: true, IsVL: false, MaxTokens: 116000},
-		{ID: "mimo-v2.6-pro", Name: "MiMo-V2.6-Pro", IsReasoning: true, IsVL: true, MaxTokens: 200000},
-		{ID: "mimo-v2.6-flash", Name: "MiMo-V2.6-Flash", IsReasoning: true, IsVL: true, MaxTokens: 200000},
-		{ID: "step-5-preview", Name: "Step-5-Preview", IsReasoning: true, IsVL: true, MaxTokens: 116000},
+		{ID: "glm-5.3", Name: "GLM-5.3", IsReasoning: true, IsVL: true, MaxTokens: 116000,
+			Credits: "x0.78", MaxOutputTokens: 16000, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
+		{ID: "glm-5.3-flash", Name: "GLM-5.3-Flash", IsReasoning: true, IsVL: false, MaxTokens: 116000,
+			Credits: "x0.08", MaxOutputTokens: 16000, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
+		{ID: "glm-5.3-flashx", Name: "GLM-5.3-FlashX", IsReasoning: false, IsVL: false, MaxTokens: 116000,
+			Credits: "x0.31", MaxOutputTokens: 16000, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
+		{ID: "glm-5.2", Name: "GLM-5.2", IsReasoning: true, IsVL: true, MaxTokens: 116000,
+			Credits: "x0.78", MaxOutputTokens: 16000, Efforts: []string{"high", "extra_high"}, DefaultEffort: "high"},
+		{ID: "glm-5.1", Name: "GLM-5.1", IsReasoning: true, IsVL: true, MaxTokens: 116000,
+			Credits: "x0.83", MaxOutputTokens: 16000},
+		{ID: "glm-4.7", Name: "GLM-4.7", IsReasoning: true, IsVL: true, MaxTokens: 116000,
+			Credits: "x0.38", MaxOutputTokens: 16000},
+		{ID: "kimi-k3", Name: "Kimi-K3", IsReasoning: true, IsVL: true, MaxTokens: 200000,
+			Credits: "x1.83", MaxOutputTokens: 32000, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "extra_high"},
+		{ID: "kimi-k2.8-preview", Name: "Kimi-K2.8-Preview", IsReasoning: true, IsVL: true, MaxTokens: 200000,
+			Credits: "x0.98", MaxOutputTokens: 32000, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "extra_high"},
+		{ID: "kimi-k2.7-code", Name: "Kimi-K2.7-Code", IsReasoning: true, IsVL: false, MaxTokens: 200000,
+			Credits: "x0.83", MaxOutputTokens: 32000},
+		{ID: "kimi-k2", Name: "Kimi-K2", IsReasoning: true, IsVL: true, MaxTokens: 116000,
+			Credits: "x0.48", MaxOutputTokens: 16000},
+		{ID: "DeepSeek-V4-Pro", Name: "DeepSeek-V4-Pro", IsReasoning: true, IsVL: true, MaxTokens: 116000,
+			Credits: "x0.36", MaxOutputTokens: 16000, Efforts: []string{"high", "extra_high"}, DefaultEffort: "high"},
+		{ID: "DeepSeek-V4-Flash", Name: "DeepSeek-V4-Flash", IsReasoning: true, IsVL: false, MaxTokens: 116000,
+			Credits: "x0.10", MaxOutputTokens: 16000, Efforts: []string{"high", "extra_high"}, DefaultEffort: "high"},
+		{ID: "DeepSeek-V4-Pro-Official", Name: "DeepSeek-V4-Pro-Official", IsReasoning: true, IsVL: true, MaxTokens: 116000,
+			Credits: "x0.36", MaxOutputTokens: 16000, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
+		{ID: "DeepSeek-V4-Flash-Official", Name: "DeepSeek-V4-Flash-Official", IsReasoning: true, IsVL: false, MaxTokens: 116000,
+			Credits: "x0.10", MaxOutputTokens: 16000, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
+		{ID: "deepseek-v4.1-flash", Name: "DeepSeek-V4.1-Flash", IsReasoning: false, IsVL: false, MaxTokens: 116000,
+			Credits: "x0.06", MaxOutputTokens: 16000, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
+		{ID: "Doubao-Seed-2.1-Pro", Name: "Doubao-Seed-2.1-Pro", IsReasoning: true, IsVL: true, MaxTokens: 256000,
+			Credits: "x0.80", MaxOutputTokens: 32000, Efforts: []string{"light", "high"}, DefaultEffort: "high"},
+		{ID: "Doubao-Seed-2.1-Turbo", Name: "Doubao-Seed-2.1-Turbo", IsReasoning: false, IsVL: true, MaxTokens: 256000,
+			Credits: "x0.20", MaxOutputTokens: 32000, Efforts: []string{"light", "high"}, DefaultEffort: "high"},
+		{ID: "Doubao-Seed-Code", Name: "Doubao-Seed-Code", IsReasoning: true, IsVL: false, MaxTokens: 256000,
+			Credits: "x0.06", MaxOutputTokens: 32000, Efforts: []string{"light", "high"}, DefaultEffort: "high"},
+		{ID: "Doubao-Seed-Evolving", Name: "Seed-Evolving", IsReasoning: true, IsVL: true, MaxTokens: 256000,
+			Credits: "x0.80", MaxOutputTokens: 32000},
+		{ID: "qwen3.8-max", Name: "Qwen3.8-Max", IsReasoning: true, IsVL: true, MaxTokens: 200000,
+			Credits: "x1.50", MaxOutputTokens: 32000, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
+		{ID: "qwen3.8-flash", Name: "Qwen3.8-Flash", IsReasoning: false, IsVL: false, MaxTokens: 200000,
+			Credits: "x0.08", MaxOutputTokens: 32000, Efforts: []string{"light", "high", "extra_high"}, DefaultEffort: "high"},
+		{ID: "qwen-3.7-plus", Name: "Qwen3.7-Plus", IsReasoning: true, IsVL: true, MaxTokens: 200000,
+			Credits: "x0.25", MaxOutputTokens: 32000},
+		{ID: "qwen3-coder", Name: "Qwen3-Coder", IsReasoning: true, IsVL: false, MaxTokens: 116000,
+			Credits: "x0.26", MaxOutputTokens: 16000},
+		{ID: "minimax-m3", Name: "MiniMax-M3", IsReasoning: true, IsVL: true, MaxTokens: 116000,
+			Credits: "x0.26", MaxOutputTokens: 16000},
+		{ID: "minimax-m2.1", Name: "MiniMax-M2.1", IsReasoning: true, IsVL: false, MaxTokens: 116000,
+			Credits: "x0.19", MaxOutputTokens: 16000},
+		{ID: "mimo-v2.6-pro", Name: "MiMo-V2.6-Pro", IsReasoning: true, IsVL: true, MaxTokens: 200000,
+			Credits: "x0.15", MaxOutputTokens: 32000},
+		{ID: "mimo-v2.6-flash", Name: "MiMo-V2.6-Flash", IsReasoning: true, IsVL: true, MaxTokens: 200000,
+			Credits: "x0.06", MaxOutputTokens: 32000},
+		{ID: "step-5-preview", Name: "Step-5-Preview", IsReasoning: true, IsVL: true, MaxTokens: 116000,
+			Credits: "x0.48", MaxOutputTokens: 16000, Efforts: []string{"light", "high"}, DefaultEffort: "high"},
 	}
 }

@@ -35,11 +35,16 @@ func RegisterBrandCatalogs() {
 	qoderEntries := make([]provider.ModelEntry, 0, len(QoderChatModels()))
 	for _, m := range QoderChatModels() {
 		qoderEntries = append(qoderEntries, provider.ModelEntry{
-			ID:            m.ID,
-			DisplayName:   m.DisplayName,
-			IsVL:          m.IsVL,
-			IsReasoning:   m.IsReasoning,
-			ContextLength: m.MaxInputTokens,
+			ID:                 m.ID,
+			DisplayName:        m.DisplayName,
+			IsVL:               m.IsVL,
+			IsReasoning:        m.IsReasoning,
+			ContextLength:      m.MaxInputTokens,
+			MaxOutputTokens:    m.MaxOutputTokens,
+			Credits:            m.Credits,
+			Efforts:            m.Efforts,
+			DefaultEffort:      m.DefaultEffort,
+			CanDisableThinking: m.CanDisableThinking,
 		})
 	}
 	provider.RegisterChatModels(provider.Qoder, qoderEntries)
@@ -48,11 +53,16 @@ func RegisterBrandCatalogs() {
 	traeEntries := make([]provider.ModelEntry, 0, len(TraeChatModels()))
 	for _, m := range TraeChatModels() {
 		traeEntries = append(traeEntries, provider.ModelEntry{
-			ID:            m.ID,
-			DisplayName:   m.Name,
-			IsVL:          m.IsVL,
-			IsReasoning:   m.IsReasoning,
-			ContextLength: int64(m.MaxTokens),
+			ID:                 m.ID,
+			DisplayName:        m.Name,
+			IsVL:               m.IsVL,
+			IsReasoning:        m.IsReasoning,
+			ContextLength:      int64(m.MaxTokens),
+			MaxOutputTokens:    m.MaxOutputTokens,
+			Credits:            m.Credits,
+			Efforts:            m.Efforts,
+			DefaultEffort:      m.DefaultEffort,
+			CanDisableThinking: m.CanDisableThinking,
 		})
 	}
 	provider.RegisterChatModels(provider.Trae, traeEntries)

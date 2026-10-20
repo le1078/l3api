@@ -556,6 +556,22 @@ func (h *Handler) modelList() []map[string]any {
 			if mi.ContextLength > 0 {
 				entry["context_length"] = mi.ContextLength
 			}
+			// 能力五列（与面板/WorkBuddy 同口径；0/空省略，不编造）。
+			if mi.MaxOutputTokens > 0 {
+				entry["max_output_tokens"] = mi.MaxOutputTokens
+			}
+			if mi.Credits != "" {
+				entry["credits"] = mi.Credits
+			}
+			if len(mi.Efforts) > 0 {
+				entry["reasoning_supported_efforts"] = mi.Efforts
+				if mi.DefaultEffort != "" {
+					entry["reasoning_default_effort"] = mi.DefaultEffort
+				}
+			}
+			if mi.CanDisableThinking {
+				entry["can_disable_thinking"] = true
+			}
 			out = append(out, entry)
 		}
 	}
@@ -738,7 +754,6 @@ func (h *Handler) activeFreePromo(realm, bareModel string) *upstream.ModelPromot
 	}
 	return nil // 目录里没这个模型（未知模型）→ 不守护
 }
-
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// OpenAI 原生端点：读体 + 单次解析事实，随后交 doChat 轮转核心（OpenAI sink 恒等输出）。

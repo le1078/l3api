@@ -383,7 +383,9 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			acctCN = a
 		}
 	}
-	if acctCN == nil && acctGlobal == nil {
+	// 没有 codebuddy 账号时仍应展示 qoder/trae 静态目录（它们不依赖账号在线）；
+	// 只有「连一个账号都没有」才报 503。
+	if acctCN == nil && acctGlobal == nil && len(p.cfg.Pool.List()) == 0 {
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
@@ -406,7 +408,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			"call_id":              "cn:" + mi.ID,
 			"name":                 mi.Name,
 			"brand":                string(provider.CodeBuddy), // CN 段：本循环只装 CN 目录（global 走下方 codebuddy-global 段）
-			"badge":                mi.Badge, // 营销徽章（限时免费/夜间免费/夜间折扣，上游 tags 实时值）
+			"badge":                mi.Badge,                   // 营销徽章（限时免费/夜间免费/夜间折扣，上游 tags 实时值）
 			"default_effort":       mi.DefaultEffort,
 			"supported_efforts":    mi.Efforts,
 			"can_disable_thinking": mi.CanDisableThinking,
@@ -433,19 +435,19 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, p.cfg.Upstream.HTTP); ok {
 			entry["max_output_tokens"] = mo
 		}
-			if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
-				entry["supported_efforts"] = efforts
-				if def != "" {
-					entry["default_effort"] = def
-				}
+		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+			entry["supported_efforts"] = efforts
+			if def != "" {
+				entry["default_effort"] = def
 			}
-			// 营销/折扣活动（带准确时段）：结构化促销优先，无则回落徽章兜底窗口。
-			// active 现算——面板每次点「重新获取」都重新拉目录，不缓存 bool。
-			if pm := upstream.PromotionJSON(mi.EffectivePromotion(), time.Now()); pm != nil {
-				entry["promotion"] = pm
-			}
-			out = append(out, entry)
 		}
+		// 营销/折扣活动（带准确时段）：结构化促销优先，无则回落徽章兜底窗口。
+		// active 现算——面板每次点「重新获取」都重新拉目录，不缓存 bool。
+		if pm := upstream.PromotionJSON(mi.EffectivePromotion(), time.Now()); pm != nil {
+			entry["promotion"] = pm
+		}
+		out = append(out, entry)
+	}
 	// 追加国际版（global realm）目录：品牌标 codebuddy-global（与 CN 区分），
 	// call_id 带 global: 前缀（与 /v1/models 的路由协议一致）。
 	if acctGlobal != nil {
@@ -469,45 +471,63 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 				"is_default":           mi.IsDefault,
 				"supports_tool_call":   mi.SupportsToolCall,
 			}
-				if mi.ContextWindow > 0 {
-					entry["context_length"] = mi.ContextWindow
-				}
-				if mi.MaxTokens > 0 {
-					entry["max_output_tokens"] = mi.MaxTokens
-				}
-				// 国际版促销（实测 global 域 modelPromotions 为 0 条，故通常无此字段；
-				// 上游若日后下发则自动生效，与 CN 段同口径）。
-				if pm := upstream.PromotionJSON(mi.EffectivePromotion(), time.Now()); pm != nil {
-					entry["promotion"] = pm
-				}
-				out = append(out, entry)
+			if mi.ContextWindow > 0 {
+				entry["context_length"] = mi.ContextWindow
 			}
+			if mi.MaxTokens > 0 {
+				entry["max_output_tokens"] = mi.MaxTokens
+			}
+			// 国际版促销（实测 global 域 modelPromotions 为 0 条，故通常无此字段；
+			// 上游若日后下发则自动生效，与 CN 段同口径）。
+			if pm := upstream.PromotionJSON(mi.EffectivePromotion(), time.Now()); pm != nil {
+				entry["promotion"] = pm
+			}
+			out = append(out, entry)
 		}
+	}
 	// 追加 Qoder 静态模型目录（仅作能力展示，不依赖账号在线；与 /v1/models 同源）。
+	// 2026-10-21 起与 WorkBuddy 动态目录同口径补齐五列：credits / default_effort /
+	// supported_efforts / context_length / max_output_tokens。
 	for _, qm := range upstream.QoderChatModels() {
 		entry := map[string]any{
-			"id":                 qm.ID,
-			"call_id":            "qoder:" + qm.ID,
-			"name":               qm.DisplayName,
-			"brand":              string(provider.Qoder),
-			"vendor":             "Qoder (阿里)",
-			"supports_reasoning": qm.IsReasoning,
-			"supports_images":    qm.IsVL,
-			"is_default":         qm.ID == "auto",
+			"id":                   qm.ID,
+			"call_id":              "qoder:" + qm.ID,
+			"name":                 qm.DisplayName,
+			"brand":                string(provider.Qoder),
+			"vendor":               "Qoder (阿里)",
+			"supports_reasoning":   qm.IsReasoning,
+			"supports_images":      qm.IsVL,
+			"is_default":           qm.ID == "auto",
+			"can_disable_thinking": qm.CanDisableThinking,
+			"credits":              qm.Credits,
+			"default_effort":       qm.DefaultEffort,
+			"supported_efforts":    qm.Efforts,
 		}
 		if qm.MaxInputTokens > 0 {
 			entry["context_length"] = qm.MaxInputTokens
 		}
+		if qm.MaxOutputTokens > 0 {
+			entry["max_output_tokens"] = qm.MaxOutputTokens
+			entry["max_output_estimated"] = true // 品牌目录无官方输出上限，按窗口 1/4 估算
+		}
 		out = append(out, entry)
 	}
-	// 追加 Trae 静态模型目录（不走模型路由，仅作能力展示）。
+	// 追加 Trae 静态模型目录（不走模型路由，仅作能力展示；五列口径同上）。
 	for _, tm := range upstream.TraeChatModels() {
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"id": tm.ID, "call_id": "trae:" + tm.ID, "name": tm.Name, "brand": string(provider.Trae),
 			"vendor": "Trae (字节)", "is_default": false,
 			"supports_reasoning": tm.IsReasoning, "supports_images": tm.IsVL,
-			"context_length": tm.MaxTokens,
-		})
+			"context_length":       tm.MaxTokens,
+			"can_disable_thinking": tm.CanDisableThinking,
+			"credits":              tm.Credits,
+			"default_effort":       tm.DefaultEffort,
+			"supported_efforts":    tm.Efforts,
+		}
+		if tm.MaxOutputTokens > 0 {
+			entry["max_output_tokens"] = tm.MaxOutputTokens
+		}
+		out = append(out, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }

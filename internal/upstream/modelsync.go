@@ -251,12 +251,22 @@ func (c *Client) ProbeQoderModels(ctx context.Context, a *auth.Auth) ([]QoderMod
 func parseQoderModelList(raw []byte) ([]QoderModel, error) {
 	var env struct {
 		Chat []struct {
-			Key            string `json:"key"`
-			DisplayName    string `json:"display_name"`
-			IsVL           bool   `json:"is_vl"`
-			IsReasoning    bool   `json:"is_reasoning"`
-			MaxInputTokens int64  `json:"max_input_tokens"`
-			Enable         bool   `json:"enable"`
+			Key            string   `json:"key"`
+			DisplayName    string   `json:"display_name"`
+			IsVL           bool     `json:"is_vl"`
+			IsReasoning    bool     `json:"is_reasoning"`
+			MaxInputTokens int64    `json:"max_input_tokens"`
+			Enable         bool     `json:"enable"`
+			PriceFactor    *float64 `json:"price_factor"`
+			ThinkingConfig *struct {
+				Disabled *json.RawMessage `json:"disabled"`
+				Enabled  *struct {
+					IsDefault bool `json:"is_default"`
+					Efforts   map[string]struct {
+						IsDefault bool `json:"is_default"`
+					} `json:"efforts"`
+				} `json:"enabled"`
+			} `json:"thinking_config"`
 		} `json:"chat"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -267,15 +277,113 @@ func parseQoderModelList(raw []byte) ([]QoderModel, error) {
 		if e.Key == "" || !e.Enable {
 			continue
 		}
-		out = append(out, QoderModel{
+		m := QoderModel{
 			ID: e.Key, DisplayName: e.DisplayName,
 			IsVL: e.IsVL, IsReasoning: e.IsReasoning, MaxInputTokens: e.MaxInputTokens,
-		})
+			Credits:         qoderCreditsText(e.PriceFactor),
+			MaxOutputTokens: brandMaxOutputGuess(e.MaxInputTokens),
+		}
+		if tc := e.ThinkingConfig; tc != nil {
+			m.CanDisableThinking = tc.Disabled != nil
+			if en := tc.Enabled; en != nil && len(en.Efforts) > 0 {
+				// 稳定输出：按固定顺序（low/medium/high/xhigh/max）排列，
+				// 避免 map 迭代顺序导致 diff 每轮误报 Changed。
+				for _, name := range []string{"low", "medium", "high", "xhigh", "max"} {
+					if ef, ok := en.Efforts[name]; ok {
+						m.Efforts = append(m.Efforts, name)
+						if ef.IsDefault {
+							m.DefaultEffort = name
+						}
+					}
+				}
+				// 兜底：上游出现枚举外档位时按字典序补上，不丢信息。
+				for _, name := range sortedEffortKeys(en.Efforts) {
+					if !containsEffort(m.Efforts, name) {
+						m.Efforts = append(m.Efforts, name)
+					}
+				}
+			}
+		}
+		out = append(out, m)
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("qoder modelsync: model/list chat 组为空")
 	}
 	return out, nil
+}
+
+// qoderCreditsText price_factor → 面板积分倍率原文（与 WorkBuddy 的 "x0.05" 同形）。
+// is_free 的模型 price_factor=0 → "x0.00"（面板按免费渲染）。nil → 空（不编造）。
+func qoderCreditsText(pf *float64) string {
+	if pf == nil {
+		return ""
+	}
+	return fmt.Sprintf("x%.2f", *pf)
+}
+
+// brandMaxOutputGuess 品牌目录无官方 max_output 时的输出上限估算。
+// 口径：WorkBuddy 动态目录实测「上下文:输出 ≈ 4:1」（1M→256K、200K→48K），
+// 与面板提示「多数模型实际被限制在 40K 左右」一致。四舍五入到 1K 粒度。
+// 估算值在面板上以「≈」标注（max_output_estimated=true），不与官方值混淆。
+func brandMaxOutputGuess(context int64) int64 {
+	if context <= 0 {
+		return 0
+	}
+	return ((context / 4) + 500) / 1000 * 1000
+}
+
+// qoderModelEqual 条目相等（Efforts 是 slice，不能直接 !=）。
+func qoderModelEqual(a, b QoderModel) bool {
+	if a.ID != b.ID || a.DisplayName != b.DisplayName || a.IsVL != b.IsVL ||
+		a.IsReasoning != b.IsReasoning || a.MaxInputTokens != b.MaxInputTokens ||
+		a.Credits != b.Credits || a.MaxOutputTokens != b.MaxOutputTokens ||
+		a.DefaultEffort != b.DefaultEffort || a.CanDisableThinking != b.CanDisableThinking {
+		return false
+	}
+	if len(a.Efforts) != len(b.Efforts) {
+		return false
+	}
+	for i := range a.Efforts {
+		if a.Efforts[i] != b.Efforts[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// traeModelEqual 条目相等（Efforts 是 slice，不能直接 !=）。
+func traeModelEqual(a, b TraeModel) bool {
+	if a.ID != b.ID || a.Name != b.Name || a.IsVL != b.IsVL ||
+		a.IsReasoning != b.IsReasoning || a.MaxTokens != b.MaxTokens ||
+		a.Credits != b.Credits || a.MaxOutputTokens != b.MaxOutputTokens ||
+		a.DefaultEffort != b.DefaultEffort || a.CanDisableThinking != b.CanDisableThinking {
+		return false
+	}
+	if len(a.Efforts) != len(b.Efforts) {
+		return false
+	}
+	for i := range a.Efforts {
+		if a.Efforts[i] != b.Efforts[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sortedEffortKeys 兜底排序（仅用于枚举外档位补全；稳定序防 diff 抖动）。
+func sortedEffortKeys(m map[string]struct {
+	IsDefault bool `json:"is_default"`
+}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j] < out[j-1]; j-- {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
+	}
+	return out
 }
 
 // ProbeTraeModels 探测 Trae 用户可见预设模型目录（parseTraeDetailParam 的
@@ -358,8 +466,8 @@ func (c *Client) probeTraeDetailParamRaw(ctx context.Context, a *auth.Auth) ([]b
 //   - 新增：只看 Visible（inv != true）；
 //   - 下架：只看 AllIDs（彻底从官方响应消失才下架）。
 type traeProbeResult struct {
-	Visible []TraeModel      // 用户可见预设（自动新增候选）
-	AllIDs  map[string]bool  // 全部官方预设 ID（含隐藏；下架判定基准）
+	Visible []TraeModel     // 用户可见预设（自动新增候选）
+	AllIDs  map[string]bool // 全部官方预设 ID（含隐藏；下架判定基准）
 }
 
 // parseTraeDetailParam 解析 get_detail_param 响应（可见性口径见
@@ -392,6 +500,10 @@ func parseTraeDetailParam(raw []byte) (*traeProbeResult, error) {
 				Multimodal bool   `json:"multimodal"`
 			} `json:"display_config"`
 			ReasoningEffort json.RawMessage `json:"reasoning_effort_config"`
+			Contact         json.RawMessage `json:"display_contact_config"`
+			Details         []struct {
+				MaxTokens int64 `json:"max_tokens"`
+			} `json:"model_detail_list"`
 		} `json:"config_info_list"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -424,15 +536,111 @@ func parseTraeDetailParam(raw []byte) (*traeProbeResult, error) {
 		}
 		reasoning := e.Display.Capability == "reasoning_model" ||
 			(len(e.ReasoningEffort) > 0 && string(e.ReasoningEffort) != "null")
-		res.Visible = append(res.Visible, TraeModel{
+		tm := TraeModel{
 			ID: e.ConfigName, Name: e.Display.Name,
 			IsReasoning: reasoning, IsVL: e.Display.Multimodal, MaxTokens: e.ContextWin.Dev,
-		})
+			Credits:         traeCreditsText(e.Contact),
+			MaxOutputTokens: traeMaxOutput(e.Details, int64(e.ContextWin.Dev)),
+		}
+		if ec := parseTraeEffort(e.ReasoningEffort); ec != nil {
+			tm.Efforts = ec.efforts
+			tm.DefaultEffort = ec.defaultEffort
+			tm.CanDisableThinking = ec.canDisable
+		}
+		res.Visible = append(res.Visible, tm)
 	}
 	if len(res.AllIDs) == 0 {
 		return nil, fmt.Errorf("trae modelsync: get_detail_param 无预设模型")
 	}
 	return res, nil
+}
+
+// traeEffortCap reasoning_effort_config 的归一结果。
+type traeEffortCap struct {
+	efforts       []string
+	defaultEffort string
+	canDisable    bool
+}
+
+// parseTraeEffort 解析 reasoning_effort_config（JSON 形态：
+// {"support_thinking":true,"default_level":"high","options":["light","high"]}）。
+// 非对象/无 options → nil（固定档或不可调，面板按 supports_reasoning 显示「固定档」）。
+func parseTraeEffort(raw json.RawMessage) *traeEffortCap {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var ec struct {
+		SupportThinking bool     `json:"support_thinking"`
+		DefaultLevel    string   `json:"default_level"`
+		Options         []string `json:"options"`
+		CanDisable      bool     `json:"can_disable"`
+	}
+	if err := json.Unmarshal(raw, &ec); err != nil {
+		return nil
+	}
+	if len(ec.Options) == 0 {
+		return nil
+	}
+	// options 保持上游顺序（Trae 口径 light→high→extra_high 本身即稳定序）。
+	return &traeEffortCap{
+		efforts:       append([]string(nil), ec.Options...),
+		defaultEffort: ec.DefaultLevel,
+		canDisable:    ec.CanDisable,
+	}
+}
+
+// traeCreditsText display_contact_config（对象或字符串化 JSON）→ 积分倍率原文。
+// 取 consumption_rate.data.rate（实测 0.06~1.83）；缺失回退活动折后
+// consumption_rate；仍无 → 空串（不编造）。
+func traeCreditsText(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		var s string
+		if err2 := json.Unmarshal(raw, &s); err2 != nil {
+			return ""
+		}
+		if err3 := json.Unmarshal([]byte(s), &obj); err3 != nil {
+			return ""
+		}
+	}
+	rate, _ := nestedFloat(obj, "consumption_rate", "data", "rate")
+	if rate <= 0 {
+		rate, _ = nestedFloat(obj, "activity_discount", "data", "current", "consumption_rate")
+	}
+	if rate <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("x%.2f", rate)
+}
+
+// traeMaxOutput model_detail_list[0].max_tokens；缺失时回落窗口估算（≈context/4）。
+func traeMaxOutput(details []struct {
+	MaxTokens int64 `json:"max_tokens"`
+}, context int64) int64 {
+	if len(details) > 0 && details[0].MaxTokens > 0 {
+		return details[0].MaxTokens
+	}
+	return brandMaxOutputGuess(context)
+}
+
+// nestedFloat 按路径取嵌套 float64（JSON 数字解成 float64）。
+func nestedFloat(obj map[string]any, path ...string) (float64, bool) {
+	var cur any = obj
+	for _, k := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return 0, false
+		}
+		cur, ok = m[k]
+		if !ok {
+			return 0, false
+		}
+	}
+	f, ok := cur.(float64)
+	return f, ok
 }
 
 // VerifyTraeModel Trae 新模型实测门：发一条极短 chat，首个实质事件为 output
@@ -484,7 +692,7 @@ func diffQoderModels(probed, current []QoderModel) ModelSyncDiff {
 		probe[m.ID] = m
 		if old, ok := cur[m.ID]; !ok {
 			d.Added = append(d.Added, m.ID)
-		} else if old != m {
+		} else if !qoderModelEqual(old, m) {
 			d.Changed = append(d.Changed, m.ID)
 		}
 	}
@@ -507,7 +715,7 @@ func diffTraeModels(probed, current []TraeModel) ModelSyncDiff {
 		probe[m.ID] = m
 		if old, ok := cur[m.ID]; !ok {
 			d.Added = append(d.Added, m.ID)
-		} else if old != m {
+		} else if !traeModelEqual(old, m) {
 			d.Changed = append(d.Changed, m.ID)
 		}
 	}
@@ -575,7 +783,7 @@ func (c *Client) SyncTraeModels(ctx context.Context, a *auth.Auth) (ModelSyncDif
 	// 不去重每轮都刷屏）。
 	var allChanged []string
 	for _, m := range res.Visible {
-		if old, ok := curByID[m.ID]; ok && old != m {
+		if old, ok := curByID[m.ID]; ok && !traeModelEqual(old, m) {
 			allChanged = append(allChanged, m.ID)
 		}
 	}

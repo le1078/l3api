@@ -3,7 +3,6 @@
 // 目标：/v1/models 的品牌区块不再逐品牌散写（handler 里每品牌一段 if）——
 // 各品牌在 upstream 侧把静态模型目录换算成 ModelEntry 注册进来，handler 按
 // 注册表遍历输出。接入新品牌的静态模型目录 = 实现目录函数 + 一行 Register。
-//
 package provider
 
 import (
@@ -23,6 +22,13 @@ type ModelEntry struct {
 	IsReasoning bool
 	// ContextLength 上下文窗口（token 数；0 = 未知，输出时省略）。
 	ContextLength int64
+	// 以下为面板「模型与档位」五列的能力字段（与 WorkBuddy 动态目录同口径）。
+	// 0/空 = 未知，输出时省略——不编造。
+	MaxOutputTokens    int64    // 最大输出 token（0=未知）
+	Credits            string   // 积分倍率原文（"x0.50"；x0.00=免费）
+	Efforts            []string // 支持的思考档位（空=固定档/未知）
+	DefaultEffort      string   // 默认思考档
+	CanDisableThinking bool     // 思考可关（off 档可用）
 }
 
 // catalog 品牌模型目录注册表（启动期注册、运行期只读——无需并发控制，

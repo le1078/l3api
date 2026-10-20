@@ -908,7 +908,9 @@ function probeDays(ts) {
   return isNaN(d) ? null : Math.floor(d);
 }
 function outCell(m, pr) {
-  if (!pr) return '<td class="num">' + (m.max_output_tokens ? fmtK(m.max_output_tokens) : '—') + '</td>';
+  // 品牌目录（qoder/trae）的 max_output_tokens 可能是窗口折算估值 → 前缀 ≈
+  const est = m.max_output_estimated ? '≈' : '';
+  if (!pr) return '<td class="num">' + (m.max_output_tokens ? est + fmtK(m.max_output_tokens) : '—') + '</td>';
   const tip = '声称 ' + (pr.claimed ? fmtK(pr.claimed) : '?') + ' · 实测 ' + (pr.measured ? fmtK(pr.measured) : '?') +
     (pr.note ? ' · ' + pr.note : '') + (pr.tested_at ? ' · 探测于 ' + pr.tested_at : '');
   const days = probeDays(pr.tested_at);
