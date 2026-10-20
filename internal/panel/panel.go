@@ -598,11 +598,16 @@ func brandPromotionJSON(badge, note, window, tz string, factor float64, credit, 
 	if isFree {
 		m["factor"] = 0
 		m["credit"] = "x0.00"
-		// 全时段免费：badge 标出原价与免费说明，面板 chips/悬浮与 WorkBuddy 同形。
+		// 免费（可能限时）：badge/说明与 WorkBuddy 同形。有 valid_until 时不要
+		// 覆盖成「不限时段」——那正是用户要看的免费截止。
 		if badge == "" {
-			m["label"] = "全时段免费"
+			if validUntil != "" {
+				m["label"] = "限时免费"
+			} else {
+				m["label"] = "全时段免费"
+			}
 		}
-		if note == "" {
+		if note == "" && validUntil == "" {
 			m["text"] = "免费模型，不限时段"
 		}
 	} else if credit != "" {
@@ -611,13 +616,15 @@ func brandPromotionJSON(badge, note, window, tz string, factor float64, credit, 
 	}
 	if validUntil != "" {
 		m["valid_until"] = validUntil
-		// 人读截止（YYYY-MM-DD HH:MM）写进说明，面板悬浮可见。
+		t := validUntil
+		if len(t) >= 16 {
+			t = t[:10] + " " + t[11:16]
+		}
+		deadline := "限时免费，至 " + t + "（UTC+8）"
 		if m["text"] == nil {
-			t := validUntil
-			if len(t) >= 16 {
-				t = t[:10] + " " + t[11:16]
-			}
-			m["text"] = "限时免费，至 " + t
+			m["text"] = deadline
+		} else if s, _ := m["text"].(string); !strings.Contains(s, "至 ") {
+			m["text"] = s + " · " + deadline
 		}
 	}
 	// 有日窗/截止时间时现算 active；全时段免费/无窗口 → 恒真。
