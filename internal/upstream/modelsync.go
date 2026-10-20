@@ -283,11 +283,19 @@ func parseQoderModelList(raw []byte) ([]QoderModel, error) {
 			Credits:         qoderCreditsText(e.PriceFactor),
 			MaxOutputTokens: brandMaxOutputGuess(e.MaxInputTokens),
 		}
+		// 固定档默认值：is_reasoning 而官方未下发档位/默认档时记 "on"
+		// （面板显示「固定档 · 默认 on」而不是「默认 ?」）。thinking_config
+		// 有值时仍以其为权威（enabled.is_default 或 efforts 的 is_default）。
+		if m.IsReasoning {
+			m.DefaultEffort = "on"
+		}
 		if tc := e.ThinkingConfig; tc != nil {
 			m.CanDisableThinking = tc.Disabled != nil
+			if en := tc.Enabled; en != nil && en.IsDefault && m.DefaultEffort == "" {
+				m.DefaultEffort = "on"
+			}
 			if en := tc.Enabled; en != nil && len(en.Efforts) == 0 && en.IsDefault {
-				// 固定档（enabled.is_default 且无 efforts 列表）：默认档记 "on"，
-				// 面板「固定档 · 默认 on」而不是「默认 ?」。
+				// 固定档（enabled.is_default 且无 efforts 列表）：默认档记 "on"。
 				m.DefaultEffort = "on"
 			}
 			if en := tc.Enabled; en != nil && len(en.Efforts) > 0 {
