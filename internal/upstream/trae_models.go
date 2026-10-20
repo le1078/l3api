@@ -32,6 +32,19 @@ type TraeModel struct {
 	Efforts            []string `json:"efforts,omitempty"`              // reasoning_effort_config.options（空=固定档/不可调）
 	DefaultEffort      string   `json:"default_effort,omitempty"`       // reasoning_effort_config.default_level
 	CanDisableThinking bool     `json:"can_disable_thinking,omitempty"` // 目前恒 false（Trae 未下发 disabled 档）
+
+	// 免费/促销（2026-10-21）：与 WorkBuddy 的 badge+promotion 同口径透出。
+	// MaxTokens 保持 context_window_tokens.dev（客户端默认窗）；ContextTiers
+	// 列出官方全部档位，面板上下文列取最大值（与 WorkBuddy 一致）。
+	ContextTiers    []int64 `json:"context_tiers,omitempty"`
+	OriginalCredits string  `json:"original_credits,omitempty"` // 活动前原价倍率
+	Badge           string  `json:"badge,omitempty"`
+	PromotionNote   string  `json:"promotion_note,omitempty"`
+	PromotionWindow string  `json:"promotion_window,omitempty"`
+	PromotionTZ     string  `json:"promotion_tz,omitempty"`
+	PromotionFactor float64 `json:"promotion_factor,omitempty"`
+	PromotionCredit string  `json:"promotion_credit,omitempty"`
+	ValidUntil      string  `json:"valid_until,omitempty"` // 限时活动截止（RFC3339）
 }
 
 // TraeChatModels 返回 Trae 预设模型目录（2026-10-09 get_detail_param 复测）。

@@ -25,6 +25,17 @@ type QoderModel struct {
 	Efforts            []string `json:"efforts,omitempty"`              // 支持的思考档位（thinking_config.enabled.efforts；空=固定档）
 	DefaultEffort      string   `json:"default_effort,omitempty"`       // 默认思考档（efforts 里的 is_default 项）
 	CanDisableThinking bool     `json:"can_disable_thinking,omitempty"` // thinking_config 含 disabled 档（off 可用）
+
+	// 免费/促销（2026-10-21）：与 WorkBuddy 的 badge+promotion 同口径透出。
+	IsFree          bool    `json:"is_free,omitempty"`          // 官方 is_free=true（全时段免费）
+	OriginalCredits string  `json:"original_credits,omitempty"` // 原价倍率（is_free 时的 original_price_factor）
+	ContextTiers    []int64 `json:"context_tiers,omitempty"`    // context_config 各档 token_count（200K/400K/1M）
+	Badge           string  `json:"badge,omitempty"`            // 促销徽章（"错峰 4 折"）
+	PromotionNote   string  `json:"promotion_note,omitempty"`   // 促销原文说明（description.zh）
+	PromotionWindow string  `json:"promotion_window,omitempty"` // 日窗 "22:00-08:00"
+	PromotionTZ     string  `json:"promotion_tz,omitempty"`
+	PromotionFactor float64 `json:"promotion_factor,omitempty"` // 折扣因子（0.4=4折）
+	PromotionCredit string  `json:"promotion_credit,omitempty"` // 折后倍率原文（如 "x0.20"）
 }
 
 // QoderChatModels 返回 Qoder chat 组模型目录（按上游返回顺序）。

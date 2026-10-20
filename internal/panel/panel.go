@@ -510,6 +510,19 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			entry["max_output_tokens"] = qm.MaxOutputTokens
 			entry["max_output_estimated"] = true // 品牌目录无官方输出上限，按窗口 1/4 估算
 		}
+		if qm.IsFree {
+			entry["is_free"] = true
+		}
+		if qm.OriginalCredits != "" {
+			entry["original_credits"] = qm.OriginalCredits
+		}
+		if len(qm.ContextTiers) > 0 {
+			entry["context_tiers"] = qm.ContextTiers
+		}
+		if pm := brandPromotionJSON(qm.Badge, qm.PromotionNote, qm.PromotionWindow, qm.PromotionTZ,
+			qm.PromotionFactor, qm.PromotionCredit, "", qm.IsFree); pm != nil {
+			entry["promotion"] = pm
+		}
 		out = append(out, entry)
 	}
 	// 追加 Trae 静态模型目录（不走模型路由，仅作能力展示；五列口径同上）。
@@ -527,9 +540,88 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		if tm.MaxOutputTokens > 0 {
 			entry["max_output_tokens"] = tm.MaxOutputTokens
 		}
+		if tm.OriginalCredits != "" {
+			entry["original_credits"] = tm.OriginalCredits
+		}
+		if len(tm.ContextTiers) > 0 {
+			entry["context_tiers"] = tm.ContextTiers
+		}
+		if pm := brandPromotionJSON(tm.Badge, tm.PromotionNote, tm.PromotionWindow, tm.PromotionTZ,
+			tm.PromotionFactor, tm.PromotionCredit, tm.ValidUntil, false); pm != nil {
+			entry["promotion"] = pm
+		}
 		out = append(out, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+}
+
+// brandPromotionJSON 把品牌目录的促销字段组装成与 WorkBuddy PromotionJSON 同形的 map
+// （面板 promoOf/freeState 直接复用，不区分品牌）。
+// isFree 时强制 factor=0/credit=x0.00（全时段免费，与 WorkBuddy 的 x0.00 同口径）。
+func brandPromotionJSON(badge, note, window, tz string, factor float64, credit, validUntil string, isFree bool) map[string]any {
+	if badge == "" && note == "" && window == "" && validUntil == "" && credit == "" && !isFree {
+		return nil
+	}
+	m := map[string]any{}
+	if badge != "" {
+		m["label"] = badge
+	}
+	if note != "" {
+		m["text"] = note
+	}
+	if window != "" {
+		m["window"] = window
+	}
+	if tz != "" {
+		m["timezone"] = tz
+	}
+	if isFree {
+		m["factor"] = 0
+		m["credit"] = "x0.00"
+	} else if credit != "" {
+		m["credit"] = credit
+		m["factor"] = factor
+	}
+	if validUntil != "" {
+		m["valid_until"] = validUntil
+	}
+	// 有日窗/截止时间时现算 active；全时段免费/无窗口 → 恒真。
+	m["active"] = true
+	if window != "" {
+		// 粗判：窗口 "22:00-08:00" 是否覆盖 now（跨午夜）。
+		m["active"] = brandWindowActive(window, time.Now())
+	}
+	return m
+}
+
+// brandWindowActive 判 "HH:MM-HH:MM" 日窗当前是否覆盖 now（支持跨午夜）。
+func brandWindowActive(window string, now time.Time) bool {
+	parts := strings.SplitN(window, "-", 2)
+	if len(parts) != 2 {
+		return true
+	}
+	parse := func(s string) (int, bool) {
+		fs := strings.SplitN(strings.TrimSpace(s), ":", 2)
+		if len(fs) != 2 {
+			return 0, false
+		}
+		h, err1 := strconv.Atoi(fs[0])
+		m, err2 := strconv.Atoi(fs[1])
+		if err1 != nil || err2 != nil {
+			return 0, false
+		}
+		return h*60 + m, true
+	}
+	sm, ok1 := parse(parts[0])
+	em, ok2 := parse(parts[1])
+	if !ok1 || !ok2 {
+		return true
+	}
+	cur := now.Hour()*60 + now.Minute()
+	if sm <= em {
+		return cur >= sm && cur < em
+	}
+	return cur >= sm || cur < em // 跨午夜
 }
 
 // modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out

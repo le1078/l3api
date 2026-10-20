@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -251,13 +252,33 @@ func (c *Client) ProbeQoderModels(ctx context.Context, a *auth.Auth) ([]QoderMod
 func parseQoderModelList(raw []byte) ([]QoderModel, error) {
 	var env struct {
 		Chat []struct {
-			Key            string   `json:"key"`
-			DisplayName    string   `json:"display_name"`
-			IsVL           bool     `json:"is_vl"`
-			IsReasoning    bool     `json:"is_reasoning"`
-			MaxInputTokens int64    `json:"max_input_tokens"`
-			Enable         bool     `json:"enable"`
-			PriceFactor    *float64 `json:"price_factor"`
+			Key                 string   `json:"key"`
+			DisplayName         string   `json:"display_name"`
+			IsVL                bool     `json:"is_vl"`
+			IsReasoning         bool     `json:"is_reasoning"`
+			MaxInputTokens      int64    `json:"max_input_tokens"`
+			Enable              bool     `json:"enable"`
+			PriceFactor         *float64 `json:"price_factor"`
+			OriginalPriceFactor *float64 `json:"original_price_factor"`
+			IsFree              *bool    `json:"is_free"`
+			ContextConfig       map[string]struct {
+				TokenCount int64 `json:"token_count"`
+				IsDefault  bool  `json:"is_default"`
+			} `json:"context_config"`
+			Promotion *struct {
+				Active bool `json:"active"`
+				Badge  struct {
+					Zh string `json:"zh"`
+				} `json:"badge"`
+				Description struct {
+					Zh string `json:"zh"`
+				} `json:"description"`
+				Timezone             string   `json:"timezone"`
+				DiscountFactor       *float64 `json:"discount_factor"`
+				BeforePromotionPrice *float64 `json:"before_promotion_price_factor"`
+				WindowStart          string   `json:"window_start"`
+				WindowEnd            string   `json:"window_end"`
+			} `json:"promotion"`
 			ThinkingConfig *struct {
 				Disabled *json.RawMessage `json:"disabled"`
 				Enabled  *struct {
@@ -282,6 +303,46 @@ func parseQoderModelList(raw []byte) ([]QoderModel, error) {
 			IsVL: e.IsVL, IsReasoning: e.IsReasoning, MaxInputTokens: e.MaxInputTokens,
 			Credits:         qoderCreditsText(e.PriceFactor),
 			MaxOutputTokens: brandMaxOutputGuess(e.MaxInputTokens),
+		}
+		if e.IsFree != nil && *e.IsFree {
+			m.IsFree = true
+		}
+		if e.OriginalPriceFactor != nil && *e.OriginalPriceFactor != *e.PriceFactor {
+			m.OriginalCredits = qoderCreditsText(e.OriginalPriceFactor)
+		}
+		// context_config 各档（200K/400K/1M）：面板上下文列取最大档（与 WorkBuddy 一致）。
+		if len(e.ContextConfig) > 0 {
+			tiers := make([]int64, 0, len(e.ContextConfig))
+			for _, v := range e.ContextConfig {
+				if v.TokenCount > 0 {
+					tiers = append(tiers, v.TokenCount)
+				}
+			}
+			sort.Slice(tiers, func(i, j int) bool { return tiers[i] < tiers[j] })
+			m.ContextTiers = tiers
+			if n := tiers[len(tiers)-1]; n > m.MaxInputTokens {
+				m.MaxInputTokens = n
+				// 上下文改用最大档后，输出上限估算也要跟上（否则仍按旧窗口折算）。
+				m.MaxOutputTokens = brandMaxOutputGuess(n)
+			}
+		}
+		if pr := e.Promotion; pr != nil && pr.Active {
+			m.Badge = pr.Badge.Zh
+			m.PromotionNote = pr.Description.Zh
+			m.PromotionTZ = pr.Timezone
+			if pr.DiscountFactor != nil {
+				m.PromotionFactor = *pr.DiscountFactor
+			}
+			if pr.BeforePromotionPrice != nil {
+				m.OriginalCredits = qoderCreditsText(pr.BeforePromotionPrice)
+			}
+			if pr.WindowStart != "" && pr.WindowEnd != "" {
+				m.PromotionWindow = pr.WindowStart + "-" + pr.WindowEnd
+			}
+			// 折后倍率 = 原价 × discount_factor（Qoder 只给 factor，不给折后价）。
+			if pr.BeforePromotionPrice != nil && pr.DiscountFactor != nil {
+				m.PromotionCredit = qoderCreditsText(ptrF(*pr.BeforePromotionPrice * *pr.DiscountFactor))
+			}
 		}
 		// 固定档默认值：is_reasoning 而官方未下发档位/默认档时记 "on"
 		// （面板显示「固定档 · 默认 on」而不是「默认 ?」）。thinking_config
@@ -324,6 +385,9 @@ func parseQoderModelList(raw []byte) ([]QoderModel, error) {
 	}
 	return out, nil
 }
+
+// ptrF 取 float64 地址（构造临时 *float64 供 qoderCreditsText）。
+func ptrF(v float64) *float64 { return &v }
 
 // qoderCreditsText price_factor → 面板积分倍率原文（与 WorkBuddy 的 "x0.05" 同形）。
 // is_free 的模型 price_factor=0 → "x0.00"（面板按免费渲染）。nil → 空（不编造）。
@@ -506,6 +570,7 @@ func parseTraeDetailParam(raw []byte) (*traeProbeResult, error) {
 			Invisible    *bool  `json:"is_invisible_to_user"` // 缺省/null = 可见
 			ContextWin   struct {
 				Dev int `json:"dev"`
+				Max int `json:"max"`
 			} `json:"context_window_tokens"`
 			Display struct {
 				Name       string `json:"display_name"`
@@ -555,6 +620,17 @@ func parseTraeDetailParam(raw []byte) (*traeProbeResult, error) {
 			Credits:         traeCreditsText(e.Contact),
 			MaxOutputTokens: traeMaxOutput(e.Details, int64(e.ContextWin.Dev)),
 		}
+		// context_window_tokens.{dev,max}：面板上下文列取最大档（与 WorkBuddy 一致）。
+		if e.ContextWin.Max > 0 && e.ContextWin.Max != e.ContextWin.Dev {
+			tm.ContextTiers = []int64{int64(e.ContextWin.Dev), int64(e.ContextWin.Max)}
+			if e.ContextWin.Max > tm.MaxTokens {
+				tm.MaxTokens = e.ContextWin.Max
+			}
+		} else if e.ContextWin.Dev > 0 {
+			tm.ContextTiers = []int64{int64(e.ContextWin.Dev)}
+		}
+		// 活动/折扣（subsidy/off_peak/limited）：原价、折后、时段、截止时间。
+		traeApplyPromotion(&tm, e.Contact)
 		if ec := parseTraeEffort(e.ReasoningEffort); ec != nil {
 			tm.Efforts = ec.efforts
 			tm.DefaultEffort = ec.defaultEffort
@@ -657,6 +733,143 @@ func nestedFloat(obj map[string]any, path ...string) (float64, bool) {
 	}
 	f, ok := cur.(float64)
 	return f, ok
+}
+
+// traeApplyPromotion 从 display_contact_config 提取免费/折扣活动（与 WorkBuddy
+// 的 badge+promotion 同口径）：subsidy/off_peak/limited 三类。
+//   - subsidy：补贴五折（current.discount_type=subsidy）
+//   - off_peak：错峰时段折扣（time_windows 星期+分钟区间）
+//   - limited：限时折扣（end_at 截止）
+func traeApplyPromotion(tm *TraeModel, raw json.RawMessage) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		var s string
+		if err2 := json.Unmarshal(raw, &s); err2 != nil {
+			return
+		}
+		if err3 := json.Unmarshal([]byte(s), &obj); err3 != nil {
+			return
+		}
+	}
+	ad, _ := obj["activity_discount"].(map[string]any)
+	if ad == nil {
+		return
+	}
+	data, _ := ad["data"].(map[string]any)
+	if data == nil {
+		return
+	}
+	cur, _ := data["current"].(map[string]any)
+	if cur == nil {
+		return
+	}
+	dtype, _ := cur["discount_type"].(string)
+	if dtype == "" || dtype == "none" {
+		return
+	}
+	before, _ := cur["before_consumption_rate"].(float64)
+	after, _ := cur["consumption_rate"].(float64)
+	if before > 0 && after > 0 && after < before {
+		tm.OriginalCredits = fmt.Sprintf("x%.2f", before)
+	}
+	// 折后倍率：current.consumption_rate（已在 credits 里），补 PromotionCredit 供面板徽章悬浮。
+	if after > 0 {
+		tm.PromotionCredit = fmt.Sprintf("x%.2f", after)
+	}
+	switch dtype {
+	case "subsidy":
+		if sub, ok := data["subsidy"].(map[string]any); ok {
+			if d, ok := sub["discount"].(float64); ok && d > 0 {
+				tm.Badge = fmt.Sprintf("补贴 %d%% off", int(d))
+				tm.PromotionFactor = 1 - d/100
+			}
+			tm.PromotionNote = "官方补贴折扣，当前生效"
+		}
+	case "off_peak":
+		if op, ok := data["off_peak"].(map[string]any); ok {
+			tm.Badge = "错峰折扣"
+			if d, ok := op["discount"].(float64); ok && d > 0 {
+				tm.Badge = fmt.Sprintf("错峰 %d%% off", int(d))
+				tm.PromotionFactor = 1 - d/100
+			}
+			if ws, ok := op["time_windows"].([]any); ok && len(ws) > 0 {
+				tm.PromotionWindow = traeWindowsText(ws)
+				tm.PromotionNote = "错峰时段折扣：" + tm.PromotionWindow
+			}
+			if tz, ok := op["time_zone"].(string); ok {
+				tm.PromotionTZ = tz
+			}
+		}
+	case "limited":
+		if lm, ok := data["limited"].(map[string]any); ok {
+			tm.Badge = "限时折扣"
+			if d, ok := lm["discount"].(float64); ok && d > 0 {
+				tm.Badge = fmt.Sprintf("限时 %d%% off", int(d))
+				tm.PromotionFactor = 1 - d/100
+			}
+			if ea, ok := lm["end_at"].(float64); ok && ea > 0 {
+				tm.ValidUntil = time.Unix(int64(ea), 0).UTC().Format(time.RFC3339)
+				tm.PromotionNote = "限时折扣，截止 " + tm.ValidUntil
+			}
+		}
+	}
+}
+
+// traeWindowsText 把 time_windows 数组格式化为 "周一-周五 00:00-09:00" 人读串。
+func traeWindowsText(ws []any) string {
+	parts := make([]string, 0, len(ws))
+	for _, w := range ws {
+		m, ok := w.(map[string]any)
+		if !ok {
+			continue
+		}
+		days, _ := m["weekdays"].([]any)
+		dayStr := traeWeekdaysText(days)
+		sm, _ := m["start_minute"].(float64)
+		em, _ := m["end_minute"].(float64)
+		parts = append(parts, fmt.Sprintf("%s %02d:%02d-%02d:%02d",
+			dayStr, int(sm)/60, int(sm)%60, int(em)/60, int(em)%60))
+	}
+	return strings.Join(parts, "、")
+}
+
+// traeWeekdaysText 把 [1,2,3] 转 "周一-周三"（1=周一）。
+func traeWeekdaysText(days []any) string {
+	if len(days) == 0 {
+		return ""
+	}
+	names := []string{"日", "一", "二", "三", "四", "五", "六"}
+	nums := make([]int, 0, len(days))
+	for _, d := range days {
+		if f, ok := d.(float64); ok {
+			nums = append(nums, int(f))
+		}
+	}
+	if len(nums) == 0 {
+		return ""
+	}
+	sort.Ints(nums)
+	// 连续段合并为 周一-周三
+	var b strings.Builder
+	for i := 0; i < len(nums); {
+		j := i
+		for j+1 < len(nums) && nums[j+1] == nums[j]+1 {
+			j++
+		}
+		if b.Len() > 0 {
+			b.WriteString("、")
+		}
+		if i == j {
+			b.WriteString("周" + names[nums[i]%7])
+		} else {
+			b.WriteString("周" + names[nums[i]%7] + "-周" + names[nums[j]%7])
+		}
+		i = j + 1
+	}
+	return b.String()
 }
 
 // VerifyTraeModel Trae 新模型实测门：发一条极短 chat，首个实质事件为 output
