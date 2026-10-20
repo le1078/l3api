@@ -578,6 +578,13 @@ func brandPromotionJSON(badge, note, window, tz string, factor float64, credit, 
 	if isFree {
 		m["factor"] = 0
 		m["credit"] = "x0.00"
+		// 全时段免费：badge 标出原价与免费说明，面板 chips/悬浮与 WorkBuddy 同形。
+		if badge == "" {
+			m["label"] = "全时段免费"
+		}
+		if note == "" {
+			m["text"] = "免费模型，不限时段"
+		}
 	} else if credit != "" {
 		m["credit"] = credit
 		m["factor"] = factor
