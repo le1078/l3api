@@ -2,6 +2,7 @@
 package upstream
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"strconv"
@@ -104,12 +105,12 @@ func TestTraeTranslator_PrereadErrorClassified(t *testing.T) {
 		{9999, "mystery", ErrServer},
 	}
 	for _, tc := range cases {
-			tr := &traeSSETranslator{
-				rc: traeFakeStream(
-					"event:progress_notice\ndata: {\"name\":\"construct_prompt\"}\n",
-					"event:error\ndata: {\"code\":"+itoa(tc.code)+",\"message\":"+quote(tc.msg)+"}\n",
-					"event:done\ndata: {\"finish_reason\":\"\"}\n",
-				),
+		tr := &traeSSETranslator{
+			rc: traeFakeStream(
+				"event:progress_notice\ndata: {\"name\":\"construct_prompt\"}\n",
+				"event:error\ndata: {\"code\":"+itoa(tc.code)+",\"message\":"+quote(tc.msg)+"}\n",
+				"event:done\ndata: {\"finish_reason\":\"\"}\n",
+			),
 			cancel: func() {},
 			id:     "t",
 		}
@@ -204,3 +205,189 @@ func TestTraeTranslator_EOFWithoutDone(t *testing.T) {
 func itoa(i int) string { return strconv.Itoa(i) }
 
 func quote(s string) string { return `"` + s + `"` }
+
+// ── 工具调用（2026-10-21）────────────────────────────────────────────────────
+
+// TestTraeBuildChatBody_SendsTools 请求体必须带上 tools 声明。
+//
+// 回归背景：此前 traeBuildChatBody **从不发送 tools**，上游因此看不到任何工具
+// 声明，模型只会用自然语言说「我没有 get_weather 工具」——用户侧表现为
+// 「Trae 完全不调用工具」。上游本身是支持的（实测带 tools 时上游会正常吐
+// tool_calls）。
+func TestTraeBuildChatBody_SendsTools(t *testing.T) {
+	body := []byte(`{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"get_weather","description":"get weather",
+		"parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}`)
+	out, err := traeBuildChatBody(body, "glm-5.3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, `"tools"`) || !strings.Contains(s, `"get_weather"`) {
+		t.Fatalf("tools missing from body: %s", s)
+	}
+}
+
+// TestTraeBuildChatBody_ToolsParametersMustBeString parameters 必须是 JSON 字符串。
+//
+// 上游按 Go 结构体 FunctionDefinition 反序列化，其 parameters 字段类型是
+// string——传对象会得到 400（实测 code 4001："cannot unmarshal object into Go
+// struct field FunctionDefinition.tools.function.parameters of type string"）。
+func TestTraeBuildChatBody_ToolsParametersMustBeString(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"get_weather","description":"get weather",
+		"parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}`)
+	out, err := traeBuildChatBody(body, "glm-5.3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req traeChatRequest
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Tools) != 1 {
+		t.Fatalf("tools count = %d, want 1", len(req.Tools))
+	}
+	got := req.Tools[0].Function.Parameters
+	if !strings.HasPrefix(got, "{") {
+		t.Fatalf("parameters must be a JSON string, got %q", got)
+	}
+	var probe map[string]any
+	if err := json.Unmarshal([]byte(got), &probe); err != nil {
+		t.Fatalf("parameters not valid JSON: %v", err)
+	}
+	if probe["type"] != "object" {
+		t.Fatalf("parameters content wrong: %v", probe)
+	}
+	// name/description 必须保留（上游靠它们把工具喂给模型）。
+	if req.Tools[0].Function.Name != "get_weather" {
+		t.Fatalf("tool name lost: %+v", req.Tools[0])
+	}
+	if req.Tools[0].Function.Description != "get weather" {
+		t.Fatalf("tool description lost: %+v", req.Tools[0])
+	}
+}
+
+// 没有 tools 的请求不得凭空多出 tools 字段（omitempty）。
+func TestTraeBuildChatBody_NoToolsOmitted(t *testing.T) {
+	out, err := traeBuildChatBody([]byte(`{"messages":[{"role":"user","content":"hi"}]}`), "glm-5.3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), `"tools"`) {
+		t.Fatalf("tools should be omitted: %s", out)
+	}
+}
+
+// TestTraeBuildChatBody_ToolCallRoundTrip assistant 的 tool_calls 与 tool 结果
+// 必须带出，且用 Trae 的**原生** function_call 形态（不是 OpenAI 的 function）。
+//
+// 实测：传 OpenAI 形态上游报 "read field 4 'FunctionCall' error: required field
+// Name is not set"——上游的 ToolCall 第 4 号字段是 FunctionCall。
+func TestTraeBuildChatBody_ToolCallRoundTrip(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"user","content":"北京天气怎么样？"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function",
+		 "function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]},
+		{"role":"tool","tool_call_id":"call_1","content":"晴，26℃"}
+	]}`)
+	out, err := traeBuildChatBody(body, "glm-5.3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req traeChatRequest
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Messages) != 3 {
+		t.Fatalf("messages count = %d, want 3", len(req.Messages))
+	}
+	asst := req.Messages[1]
+	if len(asst.ToolCalls) != 1 {
+		t.Fatalf("assistant tool_calls lost: %+v", asst)
+	}
+	if asst.ToolCalls[0].FunctionCall.Name != "get_weather" {
+		t.Fatalf("function_call.name lost: %+v", asst.ToolCalls[0])
+	}
+	if asst.ToolCalls[0].FunctionCall.Arguments != `{"city":"北京"}` {
+		t.Fatalf("function_call.arguments lost: %+v", asst.ToolCalls[0])
+	}
+	if asst.ToolCalls[0].ID != "call_1" {
+		t.Fatalf("tool_call id lost: %+v", asst.ToolCalls[0])
+	}
+	if req.Messages[2].ToolCallID != "call_1" {
+		t.Fatalf("tool_call_id lost: %+v", req.Messages[2])
+	}
+	// 原生形态必须是 function_call（不能是 OpenAI 的 function）。
+	if !strings.Contains(string(out), `"function_call"`) {
+		t.Fatalf("native function_call shape missing: %s", out)
+	}
+}
+
+// TestTraeTranslator_ToolCalls 上游 tool_calls 必须翻译成 OpenAI delta.tool_calls。
+//
+// 上游实测形态：首片带 id/name，后续片只有 arguments 片段（id/name 为空串）。
+// 翻译成 OpenAI 规范：id/name 只在首片出现，后续片**删键**（置空会让客户端
+// 看到同一次调用的 id 分裂）。
+func TestTraeTranslator_ToolCalls(t *testing.T) {
+	tr := &traeSSETranslator{
+		rc: traeFakeStream(
+			"event:output\ndata: {\"response\":\"\",\"reasoning_content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_bb69\",\"type\":\"function\",\"function_call\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"\"}}]}\n",
+			"event:output\ndata: {\"response\":\"\",\"reasoning_content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"function\",\"function_call\":{\"name\":\"\",\"arguments\":\"city\\\":\\\"北京\\\"}\"}}]}\n",
+			"event:done\ndata: {\"finish_reason\":\"stop\"}\n",
+		),
+		cancel: func() {},
+		model:  "glm-5.3",
+		id:     "chatcmpl-trae-test",
+	}
+	if ue := tr.preread(); ue != nil {
+		t.Fatalf("preread: %v", ue)
+	}
+	raw, err := io.ReadAll(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := string(tr.pending) + string(raw)
+	if !strings.Contains(all, `"tool_calls"`) {
+		t.Fatalf("tool_calls not translated:\n%s", all)
+	}
+	// 首片必须带 id + name。
+	if !strings.Contains(all, `"id":"call_bb69"`) {
+		t.Fatalf("tool_call id missing:\n%s", all)
+	}
+	if !strings.Contains(all, `"name":"get_weather"`) {
+		t.Fatalf("tool_call name missing:\n%s", all)
+	}
+	// arguments 片段必须逐片透传（拼起来是完整 JSON）。
+	if !strings.Contains(all, `arguments`) {
+		t.Fatalf("tool_call arguments missing:\n%s", all)
+	}
+	// 工具回合的 finish_reason 必须是 tool_calls（上游恒给 stop，但客户端靠
+	// finish_reason 判断该执行工具）。
+	if !strings.Contains(all, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("finish_reason should be tool_calls for tool turn:\n%s", all)
+	}
+}
+
+// 工具调用的后续片不得重复带 name（OpenAI 规范：name 只在首片）。
+func TestTraeTranslator_ToolCallNameOnlyFirstSlice(t *testing.T) {
+	tr := &traeSSETranslator{
+		rc: traeFakeStream(
+			"event:output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function_call\":{\"name\":\"g\",\"arguments\":\"{\\\"\"}}]}\n",
+			"event:output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"function\",\"function_call\":{\"name\":\"\",\"arguments\":\"a\\\":1}\"}}]}\n",
+		),
+		cancel: func() {},
+		id:     "t",
+	}
+	if ue := tr.preread(); ue != nil {
+		t.Fatalf("preread: %v", ue)
+	}
+	raw, err := io.ReadAll(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := string(tr.pending) + string(raw)
+	if strings.Count(all, `"name":"g"`) != 1 {
+		t.Fatalf("name should appear once:\n%s", all)
+	}
+}

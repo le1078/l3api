@@ -116,11 +116,57 @@ type traeChatRequest struct {
 	Stream     bool              `json:"stream"`
 	ConfigName string            `json:"config_name,omitempty"`
 	Model      string            `json:"model,omitempty"`
+	Tools      []traeTool        `json:"tools,omitempty"`
+}
+
+// traeTool 工具声明（出站形态）。
+//
+// ⚠️ parameters 必须是 **JSON 字符串**而不是对象（2026-10-21 实测）：上游按
+// Go 结构体 FunctionDefinition 反序列化，其 parameters 字段类型是 string——
+// 传对象会得到 400：
+//
+//	{"code":4001,"message":"bad request: json: cannot unmarshal object into Go
+//	 struct field FunctionDefinition.tools.function.parameters of type string"}
+//
+// 故出站前把 parameters 对象序列化成字符串。
+type traeTool struct {
+	Type     string             `json:"type"`
+	Function traeToolDefinition `json:"function"`
+}
+
+type traeToolDefinition struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Parameters  string `json:"parameters,omitempty"`
+}
+
+// traeToolCall 工具调用（出站形态）。
+//
+// ⚠️ Trae 用的是**原生** function_call 形态，不是 OpenAI 的 function 形态。
+// 实测传 OpenAI 形态（{"function":{"name":...}}）上游报：
+//
+//	read field 4 'FunctionCall' error: required field Name is not set
+//
+// 即上游的 ToolCall protobuf 第 4 号字段是 FunctionCall（内含 name/arguments），
+// 传 OpenAI 的 "function" 键上游读不到 name。实盘验证：传 function_call 形态
+// 的 assistant 消息 + role=tool 结果消息，上游正常续跑并给出结论。
+type traeToolCall struct {
+	Index        int              `json:"index"`
+	ID           string           `json:"id"`
+	Type         string           `json:"type"`
+	FunctionCall traeToolCallFunc `json:"function_call"`
+}
+
+type traeToolCallFunc struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type traeChatMessage struct {
-	Role    string            `json:"role"`
-	Content []traeContentPart `json:"content"`
+	Role       string            `json:"role"`
+	Content    []traeContentPart `json:"content"`
+	ToolCalls  []traeToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID string            `json:"tool_call_id,omitempty"`
 }
 
 type traeContentPart struct {
@@ -128,10 +174,91 @@ type traeContentPart struct {
 	Text string `json:"text"`
 }
 
+// traeBuildTools 把 OpenAI 形态的 tools 转成 Trae 出站形态。
+//
+// 两个必须做的转换（均为 2026-10-21 实测）：
+//  1. parameters 对象 → JSON 字符串（上游字段类型是 string，传对象报 4001）；
+//  2. 保留 name/description——上游按这些字段把工具喂给模型。
+//
+// parameters 已是字符串的（原样透传场景）原样保留，不做二次编码。
+// 解析不了的 tool（无 function.name）跳过——上游对无名工具会报参数错，
+// 跳过比整批失败好（实测上游对缺 name 的工具调用直接反序列化失败）。
+func traeBuildTools(in []any) []traeTool {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]traeTool, 0, len(in))
+	for _, raw := range in {
+		t, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := t["function"].(map[string]any)
+		if !ok {
+			// Responses 风格的裸工具（{"name":...,"parameters":...}）也认。
+			if name, _ := t["name"].(string); name != "" {
+				out = append(out, traeTool{
+					Type: "function",
+					Function: traeToolDefinition{
+						Name:        name,
+						Description: strOrEmpty(t["description"]),
+						Parameters:  traeParamsString(t["parameters"]),
+					},
+				})
+			}
+			continue
+		}
+		name, _ := fn["name"].(string)
+		if name == "" {
+			continue
+		}
+		out = append(out, traeTool{
+			Type: "function",
+			Function: traeToolDefinition{
+				Name:        name,
+				Description: strOrEmpty(fn["description"]),
+				Parameters:  traeParamsString(fn["parameters"]),
+			},
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// traeParamsString 把 parameters 规整成上游要的 JSON 字符串。
+// 已是字符串 → 原样；是对象/数组 → 序列化成字符串；缺失/空 → 空串（omitempty 省略）。
+func traeParamsString(v any) string {
+	switch p := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return p
+	default:
+		b, err := json.Marshal(p)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
+}
+
+// strOrEmpty 取字符串字段（缺失/非字符串 → 空串）。
+func strOrEmpty(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
 // traeBuildChatBody 把 OpenAI chat 请求体转成 llm_utils_chat 请求体。
 // model 为裸模型 key（已剥 trae: 前缀）：空 → 不传 config_name/model（上游默认模型，
 // 实测默认通道可用）；非空 → config_name 与 model 同填（上游两者都消费）。
 // system/developer 角色不拆出（llm_utils_chat 的 messages 直接接受 system 角色）。
+//
+// 工具支持（2026-10-21 补）：此前本函数**从不发送 tools**，上游因此看不到任何
+// 工具声明，模型只会用自然语言「说我没有 get_weather 工具」——用户侧表现为
+// 「Trae 完全不调用工具」。上游本身是支持的（实测带 tools 时上游会正常吐
+// tool_calls），缺口纯在本桥的请求构造与响应翻译两侧。
 func traeBuildChatBody(body []byte, model string) ([]byte, error) {
 	var req openaiChatRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -147,10 +274,29 @@ func traeBuildChatBody(body []byte, model string) ([]byte, error) {
 		if role == "developer" {
 			role = "system" // OpenAI 新名 → 上游通用名
 		}
-		msgs = append(msgs, traeChatMessage{
+		msg := traeChatMessage{
 			Role:    role,
 			Content: []traeContentPart{{Type: "text", Text: text}},
-		})
+		}
+		// 工具往返的配对信息必须原样带到上游（2026-10-21 补）：assistant 的
+		// tool_calls 与 tool 结果消息缺一，上游反序列化失败。
+		if len(m.ToolCalls) > 0 {
+			msg.ToolCalls = make([]traeToolCall, 0, len(m.ToolCalls))
+			for _, tc := range m.ToolCalls {
+				msg.ToolCalls = append(msg.ToolCalls, traeToolCall{
+					ID:   tc.ID,
+					Type: "function",
+					FunctionCall: traeToolCallFunc{
+						Name:      tc.Function.Name,
+						Arguments: tc.Function.Arguments,
+					},
+				})
+			}
+		}
+		if m.ToolCallID != "" {
+			msg.ToolCallID = m.ToolCallID
+		}
+		msgs = append(msgs, msg)
 	}
 	out := traeChatRequest{
 		Messages: msgs,
@@ -160,6 +306,9 @@ func traeBuildChatBody(body []byte, model string) ([]byte, error) {
 	if model != "" {
 		out.ConfigName = model
 		out.Model = model
+	}
+	if tools := traeBuildTools(req.Tools); len(tools) > 0 {
+		out.Tools = tools
 	}
 	return json.Marshal(out)
 }
@@ -346,6 +495,15 @@ type traeSSETranslator struct {
 	lateErr *Error
 
 	sentRole bool // 首帧 delta.role=assistant 只发一次
+
+	// 工具调用状态（2026-10-21 补）：上游按「首片带 id/name、后续片只带
+	// arguments 片段」下发，翻译成 OpenAI delta.tool_calls 时要收敛成
+	// 「id/name 只在首片出现」——后续片删键而非置空（否则客户端看到 id 分裂）。
+	toolSeenID   map[int]bool // per-index 已发过 id
+	toolSeenName map[int]bool // per-index 已发过 name
+	// sawToolCalls 本流是否发起过工具调用：决定收尾的 finish_reason
+	// （上游 done 恒给 stop，但工具回合应报 tool_calls，客户端据此执行工具）。
+	sawToolCalls bool
 }
 
 // preread 消费事件直到首个实质事件（output 正片/error/done）：
@@ -477,11 +635,20 @@ func (t *traeSSETranslator) Read(p []byte) (int, error) {
 
 // traeOutputEvent output 事件 data（response=正文增量，reasoning_content=思考增量）。
 // 新形态兼容：部分版本 output 的 data 是 {"type":"text","content":...}。
+//
+// ToolCalls 是上游的工具调用增量（2026-10-21 补）：上游以原生 function_call
+// 形态逐片下发，实测首片带 id/name、后续片只有 arguments 片段：
+//
+//	{"tool_calls":[{"index":0,"id":"call_bb69...","type":"function",
+//	                "function_call":{"name":"get_weather","arguments":"{\""}}]}
+//	{"tool_calls":[{"index":0,"id":"","type":"function",
+//	                "function_call":{"name":"","arguments":"city\":\"北京\"}"}}]}
 type traeOutputEvent struct {
-	Response         string `json:"response"`
-	ReasoningContent string `json:"reasoning_content"`
-	Content          string `json:"content"`
-	Type             string `json:"type"`
+	Response         string         `json:"response"`
+	ReasoningContent string         `json:"reasoning_content"`
+	Content          string         `json:"content"`
+	Type             string         `json:"type"`
+	ToolCalls        []traeToolCall `json:"tool_calls"`
 }
 
 // emitOutput 把一个 output 事件翻译成 OpenAI chunk 帧进 pending。
@@ -494,7 +661,8 @@ func (t *traeSSETranslator) emitOutput(data string) {
 	if content == "" && ev.Type == "text" {
 		content = ev.Content
 	}
-	if content == "" && ev.ReasoningContent == "" {
+	// 工具调用增量也要成帧：正文与思考都为空但有 tool_calls 时不能提前返回。
+	if content == "" && ev.ReasoningContent == "" && len(ev.ToolCalls) == 0 {
 		return
 	}
 	delta := map[string]any{}
@@ -508,11 +676,73 @@ func (t *traeSSETranslator) emitOutput(data string) {
 	if content != "" {
 		delta["content"] = content
 	}
+	if calls := t.emitToolCallDeltas(ev.ToolCalls); len(calls) > 0 {
+		delta["tool_calls"] = calls
+		// 本流已发起工具调用：收尾的 finish_reason 要报 tool_calls，否则
+		// 客户端会把「要调工具」的回合读成「模型只说了话」（上游 done 事件
+		// 恒给 stop，见 emitDone）。
+		t.sawToolCalls = true
+	}
 	t.writeChunk(map[string]any{
 		"id": t.id, "object": "chat.completion.chunk", "created": time.Now().Unix(),
 		"model":   t.modelOrDefault(),
 		"choices": []any{map[string]any{"index": 0, "delta": delta}},
 	})
+}
+
+// emitToolCallDeltas 把上游的 tool_calls 增量翻译成 OpenAI delta.tool_calls。
+//
+// 上游原生形态 → OpenAI 形态的映射：
+//
+//	function_call{name,arguments} → function{name,arguments}
+//
+// 上游按「首片带 id/name、后续片只带 arguments 片段」下发，OpenAI 规范同样
+// 是「id/name 只在首片出现」——故后续片**删掉** id/name 键（不是置空串），
+// 客户端据此知道 id 已在前一片给过。
+//
+// 上游后续片的 id 字段是空串（实测），直接透传会让客户端看到 id 从
+// "call_x" 变成 ""（同一次调用的 id 分裂）——必须删键。
+func (t *traeSSETranslator) emitToolCallDeltas(calls []traeToolCall) []any {
+	if len(calls) == 0 {
+		return nil
+	}
+	// 惰性初始化：本结构体在测试里以字面量构造（不带 map 字段），直接写 nil
+	// map 会 panic。
+	if t.toolSeenID == nil {
+		t.toolSeenID = map[int]bool{}
+		t.toolSeenName = map[int]bool{}
+	}
+	out := make([]any, 0, len(calls))
+	for _, tc := range calls {
+		if tc.Type != "" && tc.Type != "function" {
+			continue // 上游只支持 function 类型
+		}
+		idx := tc.Index
+		fn := map[string]any{}
+		// name 只在首片给（OpenAI 规范）；上游首片 name 非空、后续片为空串。
+		if tc.FunctionCall.Name != "" {
+			fn["name"] = tc.FunctionCall.Name
+			t.toolSeenName[idx] = true
+		} else if !t.toolSeenName[idx] {
+			// 首片就无 name：原样透传空名（防御：不让客户端拿到无 name 的调用）。
+			fn["name"] = ""
+		}
+		if tc.FunctionCall.Arguments != "" {
+			fn["arguments"] = tc.FunctionCall.Arguments
+		}
+		item := map[string]any{
+			"index":    idx,
+			"type":     "function",
+			"function": fn,
+		}
+		// id 只在首片给：上游首片带真实 id、后续片是空串。
+		if tc.ID != "" {
+			item["id"] = tc.ID
+			t.toolSeenID[idx] = true
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 // emitUsage 把 token_usage 事件翻译成带 usage 的 chunk（账本消费 usage 字段）。
@@ -551,9 +781,15 @@ func (t *traeSSETranslator) emitDone(data string) {
 	if fr == "" {
 		fr = "stop"
 	}
+	// 工具回合的 finish_reason 必须是 tool_calls（2026-10-21 补）：上游 done
+	// 事件恒给 stop，但本流发起过工具调用——客户端靠 finish_reason 判断
+	// 「该执行工具了」，报 stop 会让工具调用被当成模型说完话而丢弃。
+	if t.sawToolCalls && (fr == "stop" || fr == "") {
+		fr = "tool_calls"
+	}
 	t.writeChunk(map[string]any{
 		"id": t.id, "object": "chat.completion.chunk", "created": time.Now().Unix(),
-		"model": t.modelOrDefault(),
+		"model":   t.modelOrDefault(),
 		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": fr}},
 	})
 	t.pending = append(t.pending, "data: [DONE]\n\n"...)
