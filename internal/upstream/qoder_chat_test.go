@@ -203,3 +203,124 @@ func jsonStr(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
 }
+
+// ── 工具调用透传（2026-10-21）────────────────────────────────────────────────
+
+// TestQoderBuildChatBodyCarriesToolCalls 工具往返的配对信息必须原样进上游载荷。
+//
+// 回归背景：此前本桥只透传 role/content，把 assistant 的 tool_calls 与 tool
+// 结果的 tool_call_id 整个丢了。Qoder 网关按 OpenAI 规范严格校验配对，缺
+// tool_call_id 直接反序列化失败并回 provider_error（实测原文："messages[2]:
+// missing field `tool_call_id`"）——第二轮请求必然失败，客户端表现为「模型
+// 跑几秒就断开」且无任何报错。
+func TestQoderBuildChatBodyCarriesToolCalls(t *testing.T) {
+	in := `{"messages":[
+		{"role":"user","content":"北京天气怎么样？"},
+		{"role":"assistant","content":"","tool_calls":[
+			{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]},
+		{"role":"tool","tool_call_id":"call_1","content":"晴，26℃"}
+	]}`
+	out, err := qoderBuildChatBody([]byte(in), "conv-1", "dfmodel")
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	var p qoderChatPayload
+	if err := json.Unmarshal(out, &p); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(p.Messages) != 3 {
+		t.Fatalf("messages count = %d, want 3", len(p.Messages))
+	}
+	// assistant 的 tool_calls 必须完整带出（id/type/function.name/arguments）。
+	asst := p.Messages[1]
+	if len(asst.ToolCalls) != 1 {
+		t.Fatalf("assistant tool_calls lost: %+v", asst)
+	}
+	tc := asst.ToolCalls[0]
+	if tc.ID != "call_1" || tc.Type != "function" ||
+		tc.Function.Name != "get_weather" || tc.Function.Arguments != `{"city":"北京"}` {
+		t.Fatalf("tool_call fields wrong: %+v", tc)
+	}
+	// tool 结果消息的 tool_call_id 必须带出（缺它上游直接拒）。
+	tool := p.Messages[2]
+	if tool.Role != "tool" || tool.ToolCallID != "call_1" {
+		t.Fatalf("tool message wrong: %+v", tool)
+	}
+	if tool.Content != "晴，26℃" {
+		t.Fatalf("tool content wrong: %+v", tool)
+	}
+}
+
+// 无工具的普通请求不应凭空长出 tool_calls/tool_call_id 字段（omitempty）。
+func TestQoderBuildChatBodyNoToolFieldsWhenAbsent(t *testing.T) {
+	in := `{"messages":[{"role":"user","content":"hi"}]}`
+	out, err := qoderBuildChatBody([]byte(in), "conv-1", "dfmodel")
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if strings.Contains(string(out), "tool_calls") || strings.Contains(string(out), "tool_call_id") {
+		t.Fatalf("empty tool fields should be omitted: %s", out)
+	}
+}
+
+// ── 流内 provider_error 识别（2026-10-21）──────────────────────────────────
+
+// TestQoderSSEUnwrapperProviderError 流内业务错误必须转成 *Error。
+//
+// 回归背景：Qoder 网关把上游模型侧错误包在 HTTP 200 的 SSE 信封里回传
+// （statusCodeValue=400 + body.code="provider_error"）。此前这类帧被当成
+// 正常数据透传，客户端只收到空帧 + [DONE]，既看不到原因也无法换号重试。
+func TestQoderSSEUnwrapperProviderError(t *testing.T) {
+	detail := `{\"error\":{\"message\":\"Failed to deserialize the JSON body into the target type: messages[2]: missing field tool_call_id\"}}`
+	inner := `{"code":"provider_error","message":"Error in upstream response","type":"provider_error","details":"` + detail + `"}`
+	in := "data:{\"body\":" + jsonStr(inner) + ",\"statusCodeValue\":400,\"statusCode\":\"BAD_REQUEST\"}\n\n"
+	u := &qoderSSEUnwrapper{rc: io.NopCloser(strings.NewReader(in))}
+	_, err := io.ReadAll(u)
+	if err == nil {
+		t.Fatal("expect error for provider_error frame")
+	}
+	ue, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("err type %T, want *Error", err)
+	}
+	// 请求体畸形 → ErrBadParams（不罚号：换任何号都会失败）。
+	if ue.Kind != ErrBadParams {
+		t.Fatalf("kind = %v, want ErrBadParams", ue.Kind)
+	}
+	if ue.Status != 400 {
+		t.Fatalf("status = %d, want 400", ue.Status)
+	}
+	// 真实原因（上游原文）必须带进 Msg——客户端要看到可排查的信息。
+	if !strings.Contains(ue.Msg, "missing field") {
+		t.Fatalf("Msg lost upstream detail: %q", ue.Msg)
+	}
+}
+
+// provider_error 但原因不是请求体畸形 → 按上游语义归类（不硬判 ErrBadParams）。
+func TestQoderSSEUnwrapperProviderErrorNonParams(t *testing.T) {
+	inner := `{"code":"provider_error","message":"Error in upstream response","type":"provider_error","details":"{\"error\":{\"message\":\"upstream model temporarily unavailable\"}}"}`
+	in := "data:{\"body\":" + jsonStr(inner) + ",\"statusCodeValue\":500}\n\n"
+	u := &qoderSSEUnwrapper{rc: io.NopCloser(strings.NewReader(in))}
+	_, err := io.ReadAll(u)
+	ue, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("err type %T, want *Error", err)
+	}
+	if ue.Kind != ErrServer {
+		t.Fatalf("kind = %v, want ErrServer", ue.Kind)
+	}
+}
+
+// 正常 OpenAI 兼容帧（含 code 字段）不得被误判成 provider_error。
+func TestQoderSSEUnwrapperNoFalsePositiveProviderError(t *testing.T) {
+	inner := `{"id":"chatcmpl-x","choices":[{"delta":{"content":"ok"},"index":0}],"code":"0"}`
+	in := "data:{\"body\":" + jsonStr(inner) + ",\"statusCodeValue\":200}\n\n"
+	u := &qoderSSEUnwrapper{rc: io.NopCloser(strings.NewReader(in))}
+	out, err := io.ReadAll(u)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(out), `"ok"`) {
+		t.Fatalf("content lost: %s", out)
+	}
+}

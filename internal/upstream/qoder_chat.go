@@ -81,10 +81,32 @@ type qoderModelCfg struct {
 // qoderMessage chat 消息元素。抓包实测：content 是字符串、contents 是
 // 结构化分片 [{type:"text",text:...}]。system 角色也用同一形状（content 直接放
 // 提示词全文），上游不校验角色值——透传即可。
+//
+// ToolCalls/ToolCallID 是工具往返的必需字段（2026-10-21 补）：Qoder 网关按
+// OpenAI 规范**严格校验 tool_call ↔ tool 结果配对**——assistant 的 tool_calls
+// 缺 id 或 tool 结果缺 tool_call_id，上游直接反序列化失败并回
+// provider_error（实测原文："messages[2]: missing field `tool_call_id`"）。
+// 此前本桥只透传 role/content，把 tool_calls 整个丢了，于是「调用工具 → 回传
+// 结果」的第二轮必然失败，客户端表现为模型答非所问或空流。
 type qoderMessage struct {
-	Role     string             `json:"role"`
-	Content  string             `json:"content"`
-	Contents []qoderContentPart `json:"contents"`
+	Role       string             `json:"role"`
+	Content    string             `json:"content"`
+	Contents   []qoderContentPart `json:"contents"`
+	ToolCalls  []qoderToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID string             `json:"tool_call_id,omitempty"`
+}
+
+// qoderToolCall OpenAI 形态的工具调用（Qoder 网关按 OpenAI 形态消费：
+// {"id","type","function":{"name","arguments"}}）。
+type qoderToolCall struct {
+	ID       string            `json:"id"`
+	Type     string            `json:"type"`
+	Function qoderToolCallFunc `json:"function"`
+}
+
+type qoderToolCallFunc struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type qoderContentPart struct {
@@ -94,10 +116,15 @@ type qoderContentPart struct {
 
 // openaiChatRequest l3api 收到的 OpenAI chat 请求体（仅消费本桥需要的字段）。
 // messages[].content 可能是字符串或多模态分片数组——两种情况都兼容取文本。
+//
+// ToolCalls/ToolCallID 随消息解析（2026-10-21 补）：工具往返的配对信息必须
+// 原样带到上游，否则第二轮请求被网关拒绝。
 type openaiChatRequest struct {
 	Messages []struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
+		Role       string          `json:"role"`
+		Content    json.RawMessage `json:"content"`
+		ToolCalls  []qoderToolCall `json:"tool_calls"`
+		ToolCallID string          `json:"tool_call_id"`
 	} `json:"messages"`
 	Tools []any `json:"tools"`
 }
@@ -141,9 +168,11 @@ func qoderBuildChatBody(body []byte, conversationID, model string) ([]byte, erro
 			continue // system 不进 messages
 		default:
 			msgs = append(msgs, qoderMessage{
-				Role:     m.Role,
-				Content:  text,
-				Contents: []qoderContentPart{{Type: "text", Text: text}},
+				Role:       m.Role,
+				Content:    text,
+				Contents:   []qoderContentPart{{Type: "text", Text: text}},
+				ToolCalls:  m.ToolCalls,
+				ToolCallID: m.ToolCallID,
 			})
 		}
 	}
@@ -547,11 +576,29 @@ func (u *qoderSSEUnwrapper) emit(frame string) error {
 		var inner map[string]any
 		if bodyStr != "" && json.Unmarshal([]byte(bodyStr), &inner) == nil {
 			if code, ok := inner["code"]; ok {
-				cs := fmt.Sprint(code)
+				cs := fmt.Sprintf("%v", code)
 				if cs == "105" || cs == "105.0" {
 					return &Error{Kind: ErrSessionDead, Status: 403,
 						Msg: "qoder login expired (code 105)"}
 				}
+			}
+			// 流内业务错误（provider_error 等，2026-10-21 补）：Qoder 网关把
+			// 上游模型侧的错误（如请求体反序列化失败）包在 HTTP 200 的 SSE 信封里
+			// 回传——statusCodeValue=400 + body.code="provider_error"。
+			//
+			// 此前这类帧被当成正常数据透传：客户端只收到一串空帧 + [DONE]，
+			// 既看不到错误原因，也无从判断该换号重试——表现为「模型跑几秒就断开」
+			// 且无任何报错。必须在此转成 *Error，让 handler 走错误分类路径。
+			//
+			// 同时把错误写成 OpenAI error 帧透出（error-passthrough 语义，与
+			// codebuddy 路径一致）：客户端必须看到真实原因（上游原文），
+			// 而不是「连接被截断」。该帧走 pending → StreamHint 的 error 分支，
+			// 会以 *StreamFrameError 回到 handler 供分类罚号。
+			if ue := qoderStreamError(inner, env); ue != nil {
+				out.WriteString("data: " + qoderErrorFrame(ue) + "\n\n")
+				u.pending = append(u.pending, out.String()...)
+				// 错误已透出给客户端；粘滞返回 *Error 让 handler 分类。
+				return ue
 			}
 			// 内层是 OpenAI 兼容帧：原样写回（id/created/choices/usage 等）。
 			out.WriteString("data: " + bodyStr + "\n\n")
@@ -562,6 +609,103 @@ func (u *qoderSSEUnwrapper) emit(frame string) error {
 	}
 	u.pending = append(u.pending, out.String()...)
 	return nil
+}
+
+// qoderErrorFrame 把流内错误渲染成 OpenAI error 帧（JSON 字符串）。
+// 与 upstream 通用 error 帧形态一致（{"error":{"message","type","code"}}），
+// 供 sse.go 的 error-passthrough 路径原样写出。
+func qoderErrorFrame(ue *Error) string {
+	payload, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": ue.Msg,
+			"type":    "upstream_error",
+			"code":    ue.Kind.String(),
+		},
+	})
+	if err != nil {
+		return `{"error":{"message":"qoder upstream error","type":"upstream_error"}}`
+	}
+	return string(payload)
+}
+
+// qoderStreamError 判定 SSE 信封内层是否为上游业务错误帧，是则返回 *Error。
+//
+// 判定口径（2026-10-21 实测抓包）：
+//
+//	信封: {"headers":{...},"body":"<内层 JSON 字符串>","statusCodeValue":400,"statusCode":"BAD_REQUEST"}
+//	内层: {"code":"provider_error","message":"Error in upstream response","type":"provider_error",
+//	       "details":"{\"error\":{\"message\":\"Failed to deserialize the JSON body ...\"}}"}
+//
+// 关键：**HTTP 状态码是 200**，错误只在 SSE 信封里——所以 HTTP 层分类完全
+// 看不到它，只能在解包处识别。识别后必须转成 *Error，否则会被当成正常帧
+// 透传给客户端（客户端表现为「空流 + 无原因」）。
+//
+// 分类口径：内层 details 里携带真实原因（上游模型的报错原文），按 Classify
+// 归类。归类为请求级错误（ErrBadParams）时不罚账号——同一个畸形 body 换任何
+// 号都会失败，罚号是白扔健康号配额。
+func qoderStreamError(inner map[string]any, env map[string]any) *Error {
+	// 只有 provider_error / error 形态才算业务错误；正常的 OpenAI 兼容帧
+	// （含 "code":"0" 之类的成功码）不走这里。
+	code := fmt.Sprintf("%v", inner["code"])
+	if code != "provider_error" && code != "error" {
+		return nil
+	}
+	// 信封层状态码（400/500…）作为 HTTP 语义；缺失时按 400 兜底（上游错误帧
+	// 绝大多数是 4xx 请求级错误）。
+	status := 400
+	if scv, ok := env["statusCodeValue"].(float64); ok && int(scv) >= 400 {
+		status = int(scv)
+	}
+	// 真实原因在 details（JSON 字符串）里；退而求其次用 message。
+	detail := qoderErrorDetail(inner)
+	msg := detail
+	if msg == "" {
+		msg, _ = inner["message"].(string)
+	}
+	if msg == "" {
+		msg = "qoder upstream stream error"
+	}
+	// 按真实原因分类：请求体畸形（ErrBadParams）不罚号，其余按上游语义归类。
+	kind := Classify(status, detail)
+	if kind == ErrNone {
+		kind = ErrClient
+	}
+	// 上游模型侧的反序列化失败（"Failed to deserialize the JSON body into the
+	// target type: messages[2]: missing field `tool_call_id`"）是**请求体**问题，
+	// 不是账号问题——同一个畸形 body 换任何号都会失败。归 ErrBadParams：
+	// 不冷却/不熔断/不计错，但仍轮转（不同账号模型权限可能不同）。
+	//
+	// 通用 Classify 不认识这个 marker（它是 Qoder 模型侧的报错，不在 codebuddy
+	// 的 marker 家族里），故在此本地判定。
+	if isQoderDeserializeError(detail) {
+		kind = ErrBadParams
+	}
+	return &Error{Kind: kind, Status: status,
+		Msg: fmt.Sprintf("qoder in-stream error %d: %s", status, msg)}
+}
+
+// isQoderDeserializeError 上游模型侧的反序列化失败 marker（请求体畸形）。
+func isQoderDeserializeError(detail string) bool {
+	return strings.Contains(detail, "Failed to deserialize the JSON body") ||
+		strings.Contains(detail, "missing field")
+}
+
+// qoderErrorDetail 从 provider_error 内层提取真实报错原文。
+// details 是 JSON 字符串（内含 {"error":{"message":...}}），解析失败返回空串。
+func qoderErrorDetail(inner map[string]any) string {
+	raw, _ := inner["details"].(string)
+	if raw == "" {
+		return ""
+	}
+	var d struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(raw), &d) != nil {
+		return ""
+	}
+	return d.Error.Message
 }
 
 // qoderEnvMessage 从信封里提取错误文案（body.message 或顶层 message）。
