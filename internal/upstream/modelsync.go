@@ -285,6 +285,11 @@ func parseQoderModelList(raw []byte) ([]QoderModel, error) {
 		}
 		if tc := e.ThinkingConfig; tc != nil {
 			m.CanDisableThinking = tc.Disabled != nil
+			if en := tc.Enabled; en != nil && len(en.Efforts) == 0 && en.IsDefault {
+				// 固定档（enabled.is_default 且无 efforts 列表）：默认档记 "on"，
+				// 面板「固定档 · 默认 on」而不是「默认 ?」。
+				m.DefaultEffort = "on"
+			}
 			if en := tc.Enabled; en != nil && len(en.Efforts) > 0 {
 				// 稳定输出：按固定顺序（low/medium/high/xhigh/max）排列，
 				// 避免 map 迭代顺序导致 diff 每轮误报 Changed。
@@ -546,6 +551,9 @@ func parseTraeDetailParam(raw []byte) (*traeProbeResult, error) {
 			tm.Efforts = ec.efforts
 			tm.DefaultEffort = ec.defaultEffort
 			tm.CanDisableThinking = ec.canDisable
+		} else if reasoning {
+			// 推理模型但无可枚举档位 = 固定档：默认档记 "on"（支持思考、档位不可调）。
+			tm.DefaultEffort = "on"
 		}
 		res.Visible = append(res.Visible, tm)
 	}

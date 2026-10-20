@@ -50,7 +50,7 @@ func QoderChatModels() []QoderModel {
 func qoderSeedModels() []QoderModel {
 	return []QoderModel{
 		{ID: "auto", DisplayName: "Auto", IsVL: true, IsReasoning: true, MaxInputTokens: 200000,
-			Credits: "x0.50", MaxOutputTokens: 50000},
+			Credits: "x0.50", MaxOutputTokens: 50000, DefaultEffort: "on"},
 		{ID: "qmodel_38max", DisplayName: "Qwen3.8-Max", IsVL: true, IsReasoning: true, MaxInputTokens: 180000,
 			Credits: "x0.20", MaxOutputTokens: 45000, Efforts: []string{"low", "medium", "xhigh"}, DefaultEffort: "medium", CanDisableThinking: true},
 		{ID: "qfmodel", DisplayName: "Qwen3.8-Flash", IsVL: true, IsReasoning: true, MaxInputTokens: 180000,
@@ -58,9 +58,9 @@ func qoderSeedModels() []QoderModel {
 		{ID: "qmodel_latest", DisplayName: "Qwen3.7-Max", IsVL: true, IsReasoning: true, MaxInputTokens: 180000,
 			Credits: "x0.20", MaxOutputTokens: 45000, Efforts: []string{"low", "medium", "xhigh"}, DefaultEffort: "medium", CanDisableThinking: true},
 		{ID: "qmodel", DisplayName: "Qwen3.7-Plus", IsVL: true, IsReasoning: true, MaxInputTokens: 180000,
-			Credits: "x0.04", MaxOutputTokens: 45000, CanDisableThinking: true},
+			Credits: "x0.04", MaxOutputTokens: 45000, DefaultEffort: "on", CanDisableThinking: true},
 		{ID: "q37fmodel", DisplayName: "Qwen3.7-Flash", IsVL: true, IsReasoning: true, MaxInputTokens: 180000,
-			Credits: "x0.04", MaxOutputTokens: 45000, CanDisableThinking: true},
+			Credits: "x0.04", MaxOutputTokens: 45000, DefaultEffort: "on", CanDisableThinking: true},
 		{ID: "dmodel", DisplayName: "DeepSeek-V4-Pro", IsVL: true, IsReasoning: true, MaxInputTokens: 96000,
 			Credits: "x0.50", MaxOutputTokens: 24000, Efforts: []string{"high", "max"}, DefaultEffort: "max", CanDisableThinking: true},
 		{ID: "dfmodel", DisplayName: "DeepSeek-Flash", IsVL: true, IsReasoning: false, MaxInputTokens: 180000,
