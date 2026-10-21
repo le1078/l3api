@@ -1068,15 +1068,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
       </div>
 
-      <!-- 积分消耗（v1.16.9）：按品牌列出窗口内实测扣费。数据来自每次请求上游
-           末帧 usage.credit，与顶部「今日消耗」同源（那个是今日全天，这里是所选窗口）。 -->
+      <!-- 积分消耗（v1.16.9 起，v1.17.6 加拆分维度）：上游末帧 usage.credit 实测扣费，
+           与顶部「今日消耗」同源（那个是今日全天，这里是所选窗口）。
+           三个拆分维度与 token 侧同口径：按品牌 / 按 Key / 按模型。 -->
       <div class="box">
         <header><h3>积分消耗</h3><span class="grow"></span>
-          <span class="note">按品牌 · 上游实测扣费</span></header>
+          <span class="us-seg-lab">拆分</span>
+          <span class="segmented" id="usCreditDim" role="group" aria-label="积分消耗拆分维度">
+            <button class="seg on" data-dim="brand">按品牌</button>
+            <button class="seg" data-dim="key">按 Key</button>
+            <button class="seg" data-dim="model">按模型</button>
+          </span>
+          <span class="note" id="usCreditNote">上游实测扣费</span></header>
         <div class="tbl-wrap">
           <table class="acc">
             <thead><tr>
-              <th class="mark" aria-hidden="true"></th><th>品牌</th>
+              <th class="mark" aria-hidden="true"></th><th id="usCreditDimLabel">品牌</th>
               <th class="num">消耗积分</th><th class="num">占比</th>
               <th class="num">请求</th><th class="num">每百万 token 积分</th>
             </tr></thead>
@@ -1580,6 +1587,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div id="toasts"></div>
 
 <script src="echarts.min.js"></script>
-<script src="app.js?v=1.17.6"></script>
+<script src="app.js?v=1.17.7"></script>
 </body>
 </html>

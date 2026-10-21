@@ -487,7 +487,13 @@ type Snapshot struct {
 	// 供「用量」页的积分消耗统计表使用——用户要看的是「每个品牌烧了多少积分」，
 	// 而不是按 realm 的 cn/global 原始值。
 	ByBrand []KeyedAgg `json:"by_brand"`
-	Series  []Point    `json:"series"`
+	// ByCreditKey / ByCreditModel（v1.17.6）：积分消耗的按 Key / 按模型拆分。
+	// 与 token 侧 by_api_key / by_model 同源同口径（同一批桶、同一 KeyedAgg
+	// 结构），让「积分消耗」表格的三个拆分维度可切换而不用前端重算。
+	// 空 Key 的桶（老数据/未启用多 key）不产生 by_credit_key 条目。
+	ByCreditKey   []KeyedAgg `json:"by_credit_key,omitempty"`
+	ByCreditModel []KeyedAgg `json:"by_credit_model,omitempty"`
+	Series        []Point    `json:"series"`
 
 	// ModelSeries / KeySeries 是**逐维度**的时序（v1.15.4）：
 	//   map[模型名][]Point / map[key 名][]Point，时间片与 Series 同构（窗口内小时点 +
@@ -578,6 +584,8 @@ func (r *Recorder) Snapshot(hours int, nicks, brands map[string]string) Snapshot
 	modelAcctAgg := map[string]*aggAcc{} // 按 (uid\x00model) 拆分，供 by_model_account 维度
 	keyAgg := map[string]*aggAcc{}       // 按 API Key 名拆分（v1.11）
 	brandAgg := map[string]*aggAcc{}     // 按品牌聚合（v1.16.9）
+	credKeyAgg := map[string]*aggAcc{}   // 积分消耗按 API Key（v1.17.6）
+	credModelAgg := map[string]*aggAcc{} // 积分消耗按模型（v1.17.6）
 	hourSeries := map[string]*aggAcc{}
 	daySeries := map[string]*aggAcc{}
 	// 逐维度时序（v1.15.4）：与 hourSeries/daySeries 同一时间分片，另按 model / key
@@ -650,7 +658,18 @@ func (r *Recorder) Snapshot(hours int, nicks, brands map[string]string) Snapshot
 					keyAgg[b.Key] = &aggAcc{}
 				}
 				keyAgg[b.Key].add(b)
+				// 积分消耗按 Key（v1.17.6）：与 token 侧同源同口径，让面板
+				// 「积分消耗」表格可切换到按 Key 拆分。
+				if credKeyAgg[b.Key] == nil {
+					credKeyAgg[b.Key] = &aggAcc{}
+				}
+				credKeyAgg[b.Key].add(b)
 			}
+			// 积分消耗按模型（v1.17.6）：同上，模型维度不需要 key 归属。
+			if credModelAgg[b.Model] == nil {
+				credModelAgg[b.Model] = &aggAcc{}
+			}
+			credModelAgg[b.Model].add(b)
 
 			// 按品牌聚合（v1.16.9）：键口径与品牌时序完全一致（usageBrand）。
 			if brandAgg[usageBrand(b.Realm)] == nil {
@@ -716,14 +735,16 @@ func (r *Recorder) Snapshot(hours int, nicks, brands map[string]string) Snapshot
 		ByAccount: keyed(acctAgg, func(k string) (string, string) {
 			return k, nicks[k]
 		}),
-		ByModel:     keyed(modelAgg, func(k string) (string, string) { return k, "" }),
-		ByApiKey:    keyed(keyAgg, func(k string) (string, string) { return k, "" }),
-		ByBrand:     keyed(brandAgg, func(k string) (string, string) { return k, "" }),
-		Buckets:     len(bs),
-		Generated:   time.Now().Format(time.RFC3339),
-		WindowFrom:  hourFrom.Format(hourLayout),
-		WindowTo:    nowHour.Format(hourLayout),
-		WindowHours: hours,
+		ByModel:       keyed(modelAgg, func(k string) (string, string) { return k, "" }),
+		ByApiKey:      keyed(keyAgg, func(k string) (string, string) { return k, "" }),
+		ByBrand:       keyed(brandAgg, func(k string) (string, string) { return k, "" }),
+		ByCreditKey:   keyed(credKeyAgg, func(k string) (string, string) { return k, "" }),
+		ByCreditModel: keyed(credModelAgg, func(k string) (string, string) { return k, "" }),
+		Buckets:       len(bs),
+		Generated:     time.Now().Format(time.RFC3339),
+		WindowFrom:    hourFrom.Format(hourLayout),
+		WindowTo:      nowHour.Format(hourLayout),
+		WindowHours:   hours,
 	}
 	for i := range snap.ByAccount {
 		snap.ByAccount[i].Realm = acctRealm[snap.ByAccount[i].Key]

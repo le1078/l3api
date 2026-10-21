@@ -2173,26 +2173,42 @@ function renderUsage(d) {
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
     usRow(realmLabel(x.key), '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
 
-  // 积分消耗表（v1.16.9）：按品牌列出窗口内实测扣费。占比 = 该品牌 / 全部品牌之和；
-  // 单价按**每百万 token**折算（实测 146M token 只花 0.7 积分，按千折算一律
-  // 显示 0.0000，横向比不出贵贱）。跨模型混合均价，只用于品牌间比较。
-  const brands = (d.by_brand || []).slice().sort((a, b) => (b.credits || 0) - (a.credits || 0));
-  const credSum = brands.reduce((a, x) => a + (x.credits || 0), 0);
-  $('usCreditBody').innerHTML = brands.length ? brands.map(x => {
+  // 积分消耗表（v1.16.9 起，v1.17.6 加拆分维度）：上游末帧 usage.credit 实测扣费。
+  // 维度：按品牌 / 按 Key / 按模型——与 token 侧同口径（后端同批桶、同 KeyedAgg）。
+  // 占比 = 该行 / 该维度全部之和；单价按**每百万 token**折算（实测 146M token 只花
+  // 0.7 积分，按千折算一律显示 0.0000，横向比不出贵贱）。跨模型混合均价，只用于维度间比较。
+  const credDim = usCreditDim || 'brand';
+  const credSrc = credDim === 'key' ? (d.by_credit_key || [])
+    : credDim === 'model' ? (d.by_credit_model || [])
+    : (d.by_brand || []);
+  const credRows = credSrc.slice().sort((a, b) => (b.credits || 0) - (a.credits || 0));
+  const credSum = credRows.reduce((a, x) => a + (x.credits || 0), 0);
+  const credLabel = credDim === 'key' ? 'Key' : credDim === 'model' ? '模型' : '品牌';
+  if ($('usCreditDimLabel')) $('usCreditDimLabel').textContent = credLabel;
+  if ($('usCreditNote')) $('usCreditNote').textContent = '上游实测扣费 · ' + credDimLabel(credDim);
+  $('usCreditBody').innerHTML = credRows.length ? credRows.map(x => {
     const c = Number(x.credits || 0);
     const pct = credSum > 0 ? (c / credSum * 100) : 0;
     const perM = x.total_tokens > 0 ? (c / x.total_tokens * 1e6) : null;
+    // 名称列：品牌维度用品牌徽章；key/模型用等宽文本（key 名可能很长，title 给全名）。
+    const name = credDim === 'brand' ? brandBadge(displayBrand(x.key, x.realm))
+      : '<span style="font-family:var(--mono)" title="' + esc(x.key) + '">' + esc(x.key) + '</span>';
     return '<tr>' +
       '<td class="mark" aria-hidden="true"></td>' +
-      '<td>' + brandBadge(displayBrand(x.key, x.realm)) + '</td>' +
+      '<td>' + name + '</td>' +
       '<td class="num">' + fmtCredits(c) + '</td>' +
-      '<td class="num" title="占窗口内全部品牌积分消耗的比例">' + (credSum > 0 ? pct.toFixed(1) + '%' : '—') + '</td>' +
+      '<td class="num" title="占窗口内该维度积分消耗的比例">' + (credSum > 0 ? pct.toFixed(1) + '%' : '—') + '</td>' +
       '<td class="num">' + fmtTok(x.requests) + '</td>' +
       '<td class="num">' + (perM === null ? '—' : fmtCredits(perM)) + '</td>' +
       '</tr>';
   }).join('') : '<tr><td colspan="6" class="empty">所选窗口内没有积分消耗记录（从下一次请求起开始统计）</td></tr>';
 
   renderUsageChart(d);
+}
+
+/* credDimLabel 积分拆分维度的人话名（表头右侧 note 用）。 */
+function credDimLabel(dim) {
+  return dim === 'key' ? '按 API Key' : dim === 'model' ? '按模型' : '按品牌';
 }
 
 /* renderUsageChart 用 **ECharts** 画单条总 token 趋势线（smooth 曲线 + 数据点，
@@ -2718,6 +2734,18 @@ async function loadUsage() {
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
 if ($('usWindow')) $('usWindow').onchange = loadUsage;
 
+/* usCreditDim 积分消耗表当前拆分维度（brand/key/model）。切维度只重渲染表格，
+   不重新拉接口——三个维度的数据都在同一份快照里。 */
+let usCreditDim = 'brand';
+
+if ($('usCreditDim')) $('usCreditDim').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-dim]');
+  if (!b) return;
+  usCreditDim = b.dataset.dim;
+  $('usCreditDim').querySelectorAll('.seg').forEach(c => c.classList.toggle('on', c === b));
+  if (usLastUsage) renderUsage(usLastUsage);
+});
+
 /* 图表模式切换（全部消耗 / 按模型 / 按品牌 / 按 Key）：只重画、不重新拉接口——
    数据已在 usLastUsage 里，切换即时生效。选中态类是 .seg（v1.16.18 起图表头
    两级筛选不再用 .chip，见 index.html .uschart-hd 段）。 */
@@ -2740,17 +2768,15 @@ if ($('usMetric')) $('usMetric').addEventListener('click', ev => {
   usFigState.metric = metric;
   $('usMetric').querySelectorAll('.seg').forEach(c => c.classList.toggle('on', c === b));
 
-  // 积分指标只保留「全部消耗」与「按品牌」两个模式：按模型/按 Key 的积分
-  // 明细同样有数据，但用户这里的诉求是品牌维度，先把噪声收掉。
   const modes = $('usModes');
   if (modes) {
-    const allow = metric === 'credit' ? ['total', 'brand'] : ['total', 'model', 'brand', 'key'];
+    // 四个模式都保留（v1.17.6）：积分的 model_series/key_series 同样带 credits，
+    // 图表按积分重画即可，不需要收窄维度。
+    const allow = ['total', 'model', 'brand', 'key'];
     modes.querySelectorAll('button[data-mode]').forEach(btn => {
       btn.hidden = !allow.includes(btn.dataset.mode);
     });
-    // 切到积分时默认按品牌（用户诉求就是「积分按品牌看」）；切回 token 保留原模式。
-    if (metric === 'credit') usFigState.mode = 'brand';
-    else if (!allow.includes(usFigState.mode)) usFigState.mode = 'total';
+    if (!allow.includes(usFigState.mode)) usFigState.mode = 'total';
     modes.querySelectorAll('button[data-mode]').forEach(btn =>
       btn.classList.toggle('on', btn.dataset.mode === usFigState.mode));
   }
