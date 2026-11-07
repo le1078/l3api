@@ -17,6 +17,7 @@ import (
 	"github.com/linguo2625469/l3api/internal/notify"
 	"github.com/linguo2625469/l3api/internal/pool"
 	"github.com/linguo2625469/l3api/internal/provider"
+	"github.com/linguo2625469/l3api/internal/usage"
 	"github.com/linguo2625469/l3api/internal/upstream"
 )
 
@@ -91,6 +92,10 @@ type Config struct {
 
 	// DocsSheet 腾讯文档共享表格推送（目录变化后整块重写）。nil = 不推送。
 	DocsSheet *docsheet.Client
+
+	// Usage 用量记录器（v1.17.8）：trae/qoder 的积分消耗按余额差值记账
+	// （余额刷新每轮观测一次，见 creditdelta.go）。nil = 不记账，余额刷新照常。
+	Usage *usage.Recorder
 
 	// Notifier 事件告警（v1.11）：签到失败汇总 + 余额低于阈值外推。nil = 不告警。
 	Notifier notify.Poster
@@ -171,6 +176,12 @@ type Scheduler struct {
 	// 下一轮 tick 立即按新参数判定）。
 	modelSyncFired string
 	rearmModelSync chan struct{}
+
+	// creditLast 余额差值法基线（v1.17.8，见 creditdelta.go）：uid → 上次观测的
+	// 「累计消耗」读数。creditMu 保护。不持久化——重启后首轮重立基线，丢失量
+	// ≤ 一轮间隔的消耗（进程停机期间无代理流量）。
+	creditMu   sync.Mutex
+	creditLast map[string]float64
 }
 
 // New 构建。
@@ -200,6 +211,7 @@ func New(cfg Config) *Scheduler {
 		rearmSchedule:  make(chan struct{}, 1),
 		rearmBalance:   make(chan struct{}, 1),
 		rearmModelSync: make(chan struct{}, 1),
+		creditLast:     make(map[string]float64),
 	}
 }
 
@@ -692,6 +704,16 @@ func (s *Scheduler) RunBalanceRefreshNow(brand ...string) {
 						s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
 					}
 					s.notifyBalanceLow(uid, a.Brand(), a.Nickname, remain)
+					// 余额差值记账（v1.17.8）：trae/qoder 的聊天流没有逐请求扣费
+					// 字段（usage.credit），积分消耗借本轮余额读数反推——consumed
+					// = total-remain，正差值入账（详见 creditdelta.go）。
+					// global（codebuddy 国际版）不在此列：2026-10-24 实测其末帧
+					// 确实带 usage.credit（global:deepseek-v4.1-flash-sg 4 请求
+					// 记 0.45），逐请求路径本就在工作，叠加差值会双记。其余 cr=0
+					// 的模型是上游不计费/免费，与 cn 域同口径。
+					if brand := a.Brand(); brand == "trae" || brand == "qoder" {
+						s.observeCreditDelta(uid, brand, total-remain)
+					}
 				}()
 			}
 		}()

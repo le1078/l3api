@@ -40,7 +40,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.17.7-panel"
+const appVersion = "1.17.10-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -202,9 +202,19 @@ func main() {
 	// QoderChatModels/TraeChatModels 读取时整体替换种子；modelsync.go）。
 	upstream.SetModelSyncPath(stateSibling(cfg.StateFile, "model_sync.json"))
 
+	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
+	// datapath 由 state 文件路径推出，避免再加一个配置项。
+	// （v1.17.8 前移：scheduler.Config 要拿到 rec 做余额差值记账。）
+	usagePath := usagePathFor(cfg.StateFile)
+	rec := usage.New(usagePath)
+	rec.Start()
+	defer rec.Stop()
+	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
+		Usage:          rec,
 		CheckinHours:   cfg.Schedule.CheckinHours,
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
@@ -279,13 +289,6 @@ func main() {
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 	})
-	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
-	// datapath 由 state 文件路径推出，避免再加一个配置项。
-	usagePath := usagePathFor(cfg.StateFile)
-	rec := usage.New(usagePath)
-	rec.Start()
-	defer rec.Stop()
-	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
 	// chatHandler 前置声明：panel 的 SaveConfig 闭包要拿到 handler 以热应用
 	// server.max_body_mb，而 handler 的 Config.Panel 又依赖 pn——装配循环用

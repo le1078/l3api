@@ -495,21 +495,25 @@ type Snapshot struct {
 	ByCreditModel []KeyedAgg `json:"by_credit_model,omitempty"`
 	Series        []Point    `json:"series"`
 
-	// ModelSeries / KeySeries 是**逐维度**的时序（v1.15.4）：
+	// ModelSeries / KeySeries 是 token 口径的**逐维度**时序（v1.15.4）：
 	//   map[模型名][]Point / map[key 名][]Point，时间片与 Series 同构（窗口内小时点 +
-	//   固定日点），供面板「按模型/按 key 分色多线」图使用。命名维度先按总量取前
-	//   seriesTopN 个，其余归并为一个「其他」系列，保证系列数与图例可控。
-	// 与 Series 一样只回**用户在看的窗口**：窗口外小时桶折叠成的旧日点不出现。
-	ModelSeries map[string][]Point `json:"model_series,omitempty"`
-	KeySeries   map[string][]Point `json:"key_series,omitempty"`
+	//   固定日点），供面板「按模型/按 key 分色多线」图使用。命名维度按**窗口内**
+	//   token 总量取前 seriesTopN 个，其余归并为一个「其他」系列。
+	// CreditModelSeries / CreditKeySeries（v1.17.10）是积分口径的同一份结构：
+	// 前 N 名按**窗口内积分**排名。模型/Key 迭代很快，且「烧 token 多」不等于
+	// 「烧积分多」——共用一个固定 top 列表会让用户当前在用的模型全被并进「其他」，
+	// 积分图就只剩一条「其他」线（v1.17.9 用户实测）。两份各自有界，前端按当前
+	// 指标选一份画。
+	ModelSeries       map[string][]Point `json:"model_series,omitempty"`
+	KeySeries         map[string][]Point `json:"key_series,omitempty"`
+	CreditModelSeries map[string][]Point `json:"credit_model_series,omitempty"`
+	CreditKeySeries   map[string][]Point `json:"credit_key_series,omitempty"`
 	// BrandSeries 按品牌拆分（v1.15.11）。品牌由桶的 realm 派生：品牌账号的 realm
 	// 就是品牌名（qoder/trae），codebuddy 的 cn/global 归一为 codebuddy——无额外
 	// 持久化字段，老 usage.json 直接可用，零迁移。
 	BrandSeries map[string][]Point `json:"brand_series,omitempty"`
-	// 积分消耗时序不单独出一份：BrandSeries 的每个 Point 已经带完整 Agg（含
-	// Credits），前端按品牌画积分曲线时直接读同一条序列的 credits 字段即可——
-	// 同一份时间轴/品牌集合，只是 y 值换成积分（2026-10-18 设计取舍：
-	// 不重复传输一份形状完全相同的数据）。
+	// 品牌维度天然有界（品牌就几个），不按指标分两份：BrandSeries 的每个 Point 都
+	// 带完整 Agg（含 Credits），前端画 token/积分曲线时只是换 y 值字段。
 	Buckets   int    `json:"buckets"`
 	FileBytes int64  `json:"file_bytes"`
 	Since     string `json:"since,omitempty"`
@@ -795,14 +799,17 @@ func (r *Recorder) Snapshot(hours int, nicks, brands map[string]string) Snapshot
 	}
 
 	// 逐模型/逐 key 时序：分片组成与 Series 相同（日点在前、小时点在后），前端按
-	// 同一时间轴铺网格。命名维度按窗口内总量取前 seriesTopN，其余并成「其他」。
+	// 同一时间轴铺网格。命名维度按**窗口内当前指标**取前 seriesTopN，其余并成
+	// 「其他」——token 与积分各算一份排名，前端按指标选对应的那份画。
 	// 只含窗口内数据（窗口外小时桶折叠出的旧日点已在收集阶段剔除）。
-	snap.ModelSeries = buildDimSeries(modelHour, modelDay, topDimNames(modelHour, modelDay, seriesTopN))
-	snap.KeySeries = buildDimSeries(keyHour, keyDay, topDimNames(keyHour, keyDay, seriesTopN))
-	// 品牌维度天然有界（品牌就 3 个），不截断、无「其他」——上界取 brandHour ∪
-	// brandDay 的并集大小（只看 brandHour 会在"窗口内数据全在日桶"时算少，冒出
-	// 一个本不该存在的「其他」）。
-	snap.BrandSeries = buildDimSeries(brandHour, brandDay, topDimNames(brandHour, brandDay, len(brandHour)+len(brandDay)))
+	snap.ModelSeries = buildRankedSeries(modelHour, modelDay, seriesTopN, dayFrom, rankByTokens)
+	snap.CreditModelSeries = buildRankedSeries(modelHour, modelDay, seriesTopN, dayFrom, rankByCredits)
+	snap.KeySeries = buildRankedSeries(keyHour, keyDay, seriesTopN, dayFrom, rankByTokens)
+	snap.CreditKeySeries = buildRankedSeries(keyHour, keyDay, seriesTopN, dayFrom, rankByCredits)
+	// 品牌维度天然有界（品牌就 3 个），不截断、不按指标筛零——全员入选，两种
+	// 指标共用这一份。上界取 brandHour ∪ brandDay 的并集（只看 brandHour 会在
+	// "窗口内数据全在日桶"时算少，冒出一个本不该存在的「其他」）。
+	snap.BrandSeries = buildDimSeries(brandHour, brandDay, dimNameSet(brandHour, brandDay))
 
 	if r.path != "" {
 		if fi, err := os.Stat(r.path); err == nil {
@@ -852,20 +859,56 @@ const seriesTopN = 10
 // otherSeriesName 是归并桶的系列名，前端用它做图例末尾标注。
 const otherSeriesName = "其他"
 
-// dimTotal 一个维度值在窗口内的 total tokens 合计（跨全部可见时间片）。
-func dimTotal(hour, day map[string]map[string]*aggAcc, name string) int64 {
-	var tt int64
+// dimRank 是「前 N 名」排名所用的指标。命名维度（模型 / Key）各算两份：
+// token 图看 token 前 N，积分图看积分前 N——不能共用一个固定排名。
+type dimRank int
+
+const (
+	rankByTokens dimRank = iota
+	rankByCredits
+)
+
+// dimNameSet 返回窗口/历史出现过的全部维度值（不截断、不按值筛）。
+// 品牌维度天然有界，用它让每个品牌都单独成线。
+func dimNameSet(hour, day map[string]map[string]*aggAcc) map[string]bool {
+	out := make(map[string]bool, len(hour)+len(day))
 	for _, m := range []map[string]map[string]*aggAcc{hour, day} {
-		for _, acc := range m[name] {
-			tt += acc.TotalTokens
+		for name := range m {
+			out[name] = true
 		}
 	}
-	return tt
+	return out
+}
+
+// dimTotals 返回一个维度值在**所选窗口内**的 token / 积分合计。
+//
+// hour 只含窗口内小时格；day 含**全部历史日格**（含窗口外小时桶折叠出的日点），
+// 因此按 dayFrom 过滤。否则历史用量会永久累积，「早已不用但曾经用得多」的模型
+// 会一直霸占前 N，而用户当前在用的模型全被并进「其他」——这正是 v1.17.9 用户
+// 在积分图「按模型」下只看到「其他」的原因。
+func dimTotals(hour, day map[string]map[string]*aggAcc, name, dayFrom string) (tok int64, cred float64) {
+	for _, acc := range hour[name] {
+		tok += acc.TotalTokens
+		cred += acc.Credits
+	}
+	for slot, acc := range day[name] {
+		if dayFrom != "" && slot < dayFrom {
+			continue
+		}
+		tok += acc.TotalTokens
+		cred += acc.Credits
+	}
+	return tok, cred
 }
 
 // topDimNames 取窗口内总量前 n 的维度值（不足则全取）。并列时按名字升序，
-// 保证输出稳定。
-func topDimNames(hour, day map[string]map[string]*aggAcc, n int) map[string]bool {
+// 保证输出稳定。rank 决定「总量」是 token 还是积分。
+//
+// 该指标在窗口内为 0 的维度不进命名列表：积分视图下大多数模型根本没产生积分，
+// 若按并列名字凑满 10 个，图例会塞进一串恒 0 的模型名，反而盖住真正有消耗的
+// 那几条（v1.17.10 用户反馈）。这些 0 值维度仍归入「其他」，由 buildRankedSeries
+// 在「其他」也为 0 时整条丢弃。
+func topDimNames(hour, day map[string]map[string]*aggAcc, n int, dayFrom string, rank dimRank) map[string]bool {
 	seen := map[string]bool{}
 	names := make([]string, 0, len(hour)+len(day))
 	for _, m := range []map[string]map[string]*aggAcc{hour, day} {
@@ -877,20 +920,51 @@ func topDimNames(hour, day map[string]map[string]*aggAcc, n int) map[string]bool
 		}
 	}
 	sort.Slice(names, func(i, j int) bool {
-		ti, tj := dimTotal(hour, day, names[i]), dimTotal(hour, day, names[j])
-		if ti != tj {
+		ti, ci := dimTotals(hour, day, names[i], dayFrom)
+		tj, cj := dimTotals(hour, day, names[j], dayFrom)
+		if rank == rankByCredits {
+			if ci != cj {
+				return ci > cj
+			}
+		} else if ti != tj {
 			return ti > tj
 		}
 		return names[i] < names[j]
 	})
-	if len(names) > n {
-		names = names[:n]
-	}
-	top := make(map[string]bool, len(names))
+	top := make(map[string]bool, n)
 	for _, name := range names {
+		if len(top) >= n {
+			break
+		}
+		ti, ci := dimTotals(hour, day, name, dayFrom)
+		if rank == rankByCredits {
+			if ci <= 0 {
+				break // 已按积分降序，后面全是 0
+			}
+		} else if ti <= 0 {
+			break
+		}
 		top[name] = true
 	}
 	return top
+}
+
+// buildRankedSeries 是 buildDimSeries 的「按指标排名」包装：命名维度只取该指标
+// 前 N 名；「其他」桶若在该指标上整条为 0（剩下的维度都没用过这个指标），就不
+// 输出它——图例里一条恒 0 的灰线没有信息量。
+func buildRankedSeries(hour, day map[string]map[string]*aggAcc, n int, dayFrom string, rank dimRank) map[string][]Point {
+	out := buildDimSeries(hour, day, topDimNames(hour, day, n, dayFrom, rank))
+	other, ok := out[otherSeriesName]
+	if !ok {
+		return out
+	}
+	for _, p := range other {
+		if (rank == rankByCredits && p.Credits > 0) || (rank == rankByTokens && p.TotalTokens > 0) {
+			return out
+		}
+	}
+	delete(out, otherSeriesName)
+	return out
 }
 
 // buildDimSeries 把逐维度累加格拍平成「维度名 → 时间片序列」。

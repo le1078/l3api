@@ -2350,14 +2350,22 @@ const usFigState = { metric: 'token', mode: 'total', selected: {} };
    metric=token 用 total_tokens；metric=credit 用 credits（v1.16.9，上游实测扣费）。
    两者来自同一批桶、同一套时间片，只是取哪个字段。
    total: [{name:'总 token'|'总积分', pts: 总序列}]（单线）
-   model: model_series 的每个模型一条线
+   model: model_series / credit_model_series 的每个模型一条线
    brand: brand_series 的每个品牌一条线（品牌由后端按 realm 派生，天然有界）
-   key:   key_series 同理；空 key 桶（无归因）后端就不返回，天然不出现 */
+   key:   key_series / credit_key_series 同理；空 key 桶（无归因）后端就不返回，
+          天然不出现。
+   模型 / Key 的**前 10 名由后端按指标各算一份**（v1.17.10）：模型迭代快，
+   且烧 token 多的模型未必烧积分多，共用一份固定 top 列表会让用户当前在用的
+   模型全被并进「其他」。所以积分图必须读 credit_* 那份排名。 */
 function usModeValueSeries(snap) {
   const metric = usFigState.metric;
-  const bagOf = { model: 'model_series', brand: 'brand_series', key: 'key_series' };
+  const byCredit = metric === 'credit';
+  const bagOf = byCredit
+    ? { model: 'credit_model_series', key: 'credit_key_series', brand: 'brand_series' }
+    : { model: 'model_series', key: 'key_series', brand: 'brand_series' };
   if (bagOf[usFigState.mode]) {
-    const bag = snap[bagOf[usFigState.mode]] || {};
+    // 兼容旧后端快照（没有 credit_* 字段时退回 token 那份，至少不白屏）。
+    const bag = snap[bagOf[usFigState.mode]] || snap[usFigState.mode + '_series'] || {};
     const list = [];
     for (const name of Object.keys(bag)) {
       list.push({ name, pts: usParsePoints(bag[name], metric) });
@@ -2637,13 +2645,14 @@ function renderUsageChart(snap) {
   }
   if ($('usFigNote')) {
     let note = '';
+    const dimName = { model: '模型', brand: '品牌', key: 'Key' }[usFigState.mode] || '';
     if (isCredit) {
       note = isMulti
-        ? '共 ' + named.length + ' 条系列（按品牌的实测扣费积分，点击图例可开关）；每条线只标出它自己的峰值点。'
+        ? '共 ' + named.length + ' 条系列（按' + dimName + '的实测扣费积分，点击图例可开关）；每条线只标出它自己的峰值点。'
         : '曲线为该时段实测扣费积分之和（上游 usage.credit），点即峰值。';
     } else if (isMulti) {
       const other = named.find(s => s.name === US_OTHER_NAME);
-      note = '共 ' + named.length + ' 条系列（每系列一色，点击图例可开关）' +
+      note = '共 ' + named.length + ' 条系列（按' + dimName + '，每系列一色，点击图例可开关）' +
              (other ? '；小量维度已并入「其他」' : '') +
              '；每条线只标出它自己的峰值点。';
     }
@@ -2770,8 +2779,8 @@ if ($('usMetric')) $('usMetric').addEventListener('click', ev => {
 
   const modes = $('usModes');
   if (modes) {
-    // 四个模式都保留（v1.17.6）：积分的 model_series/key_series 同样带 credits，
-    // 图表按积分重画即可，不需要收窄维度。
+    // 四个模式都保留（v1.17.6）：积分的 credit_model_series/credit_key_series
+    // 是后端按积分单独排的前 N（v1.17.10），图表按积分重画即可，不需要收窄维度。
     const allow = ['total', 'model', 'brand', 'key'];
     modes.querySelectorAll('button[data-mode]').forEach(btn => {
       btn.hidden = !allow.includes(btn.dataset.mode);

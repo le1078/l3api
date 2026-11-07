@@ -233,6 +233,85 @@ func TestDimSeriesOtherBucket(t *testing.T) {
 	}
 }
 
+// 前 N 名的口径必须跟随指标：token 图取 token 前 N，积分图取积分前 N。
+// 两者排序不一致时，各自的前 N 名单与「其他」合计都应不同（v1.17.10）。
+func TestDimSeriesTopPerMetric(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	// 13 个模型：token 越大的积分越小（排序完全相反）。
+	for i := 0; i < seriesTopN+3; i++ {
+		r.Add(now, "cn", "u", fmt.Sprintf("t%02d", i), Delta{
+			TotalTokens: int64(1000 - i*10),
+			HasTotal:    true,
+			Credit:      float64(i),
+			HasCredit:   true,
+		}, true)
+	}
+	s := r.Snapshot(24, nil, nil)
+
+	// token 前 10 = t00..t09；t10..t12 并入「其他」= 900+890+880。
+	tok := s.ModelSeries
+	if _, ok := tok["t00"]; !ok {
+		t.Fatalf("token 口径 t00（token 最大）未单独成线: %v", tok)
+	}
+	if _, ok := tok["t12"]; ok {
+		t.Fatalf("token 口径 t12（token 最小）不应单独成线: %v", tok)
+	}
+	if o := tok[otherSeriesName]; len(o) != 1 || o[0].TotalTokens != 2670 {
+		t.Fatalf("token 口径「其他」= %+v, want 合计 2670", o)
+	}
+
+	// 积分前 10 = t12..t03；t00..t02 并入「其他」= 0+1+2。
+	cred := s.CreditModelSeries
+	if len(cred) != seriesTopN+1 {
+		t.Fatalf("credit_model_series 系列数 = %d, want %d+1(其他)", len(cred), seriesTopN)
+	}
+	if _, ok := cred["t12"]; !ok {
+		t.Fatalf("积分口径 t12（积分最大）未单独成线: %v", cred)
+	}
+	if _, ok := cred["t00"]; ok {
+		t.Fatalf("积分口径 t00（积分为 0）不应单独成线: %v", cred)
+	}
+	if o := cred[otherSeriesName]; len(o) != 1 || o[0].Credits != 3 {
+		t.Fatalf("积分口径「其他」= %+v, want 合计 3", o)
+	}
+}
+
+// 该指标为 0 的维度不占图例；「其他」整条为 0 时也不输出（避免恒 0 灰线）。
+func TestDimSeriesSkipsZeroMetric(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "u", "creditonly", Delta{Credit: 5, HasCredit: true}, true) // 0 token，5 积分
+	r.Add(now, "cn", "u", "tokenonly", Delta{TotalTokens: 100, HasTotal: true}, true)
+
+	s := r.Snapshot(24, nil, nil)
+	cm := s.CreditModelSeries
+	if len(cm) != 1 || len(cm["creditonly"]) != 1 {
+		t.Fatalf("积分口径只应有 creditonly 一条（0 积分模型与 0 值「其他」都不出）: %+v", cm)
+	}
+	tm := s.ModelSeries
+	if len(tm) != 1 || len(tm["tokenonly"]) != 1 {
+		t.Fatalf("token 口径只应有 tokenonly 一条: %+v", tm)
+	}
+}
+
+// 排名只看所选窗口：窗口外历史用量再大，也不能把当前在用的模型挤进「其他」。
+func TestDimSeriesTopWithinWindow(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	old := now.Add(-30 * 24 * time.Hour)
+	// 12 个历史模型各有 100 万 token，但窗口内为 0；fresh 只在窗口内用了 5。
+	for i := 0; i < seriesTopN+2; i++ {
+		r.Add(old, "cn", "u", fmt.Sprintf("old%02d", i), Delta{TotalTokens: 1_000_000, HasTotal: true}, true)
+	}
+	r.Add(now, "cn", "u", "fresh", Delta{TotalTokens: 5, HasTotal: true}, true)
+
+	s := r.Snapshot(24, nil, nil)
+	if _, ok := s.ModelSeries["fresh"]; !ok {
+		t.Fatalf("窗口内在用的模型 fresh 被并进「其他」: %v", s.ModelSeries)
+	}
+}
+
 func TestLifecycleFlush(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage.json")
 	r := New(path)
